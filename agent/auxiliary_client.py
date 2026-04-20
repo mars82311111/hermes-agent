@@ -2616,6 +2616,26 @@ def _build_call_kwargs(
         if _forbids_sampling_params(model):
             temperature = None
 
+    # MiniMax-M2.7-highspeed only accepts temperature=0.6 — silently clamp
+    # any other value to avoid "invalid temperature" 400 errors.
+    # Also include kimi-coding-cn and kimi-coding since they route to MiniMax API.
+    _minimax_cn = provider in ("minimax", "minimax-cn", "kimi-coding", "kimi-coding-cn")
+    # When provider="auto" the clamp above misses MiniMax because "auto" is not in the list.
+    # Fall back to model-name detection so any caller that uses provider="auto" with a
+    # MiniMax model still gets protected.
+    if not _minimax_cn and temperature is not None and temperature != 0.6:
+        _m = (model or "").lower()
+        if _m in ("minimax-m2.7-highspeed", "kimi-for-coding"):
+            _minimax_cn = True
+    # Also check base_url for MiniMax endpoints (handles provider="auto" case where
+    # the actual endpoint URL contains "minimax" or "api.minimax").
+    if not _minimax_cn and base_url:
+        _bu = base_url.lower()
+        if "minimax" in _bu or "api.minimax" in _bu:
+            _minimax_cn = True
+    if _minimax_cn and temperature != 0.6:
+        temperature = 0.6
+
     if temperature is not None:
         kwargs["temperature"] = temperature
 
@@ -2997,7 +3017,9 @@ async def async_call_llm(
                     f"was found. Set the {_explicit.upper()}_API_KEY environment "
                     f"variable, or switch to a different provider with `hermes model`."
                 )
-            if not resolved_base_url:
+            # Only auto-detect if the provider is "auto" or falsy — NOT when a specific
+            # provider was requested but its client failed (e.g. missing API key).
+            if resolved_provider in ("auto", None, "") or not resolved_base_url:
                 logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
                             task or "call", resolved_provider)
                 client, final_model = _get_cached_client("auto", async_mode=True)

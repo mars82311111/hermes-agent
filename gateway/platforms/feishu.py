@@ -236,6 +236,9 @@ _FEISHU_REACTION_FAILURE = "CrossMark"
 # delete-failures, not a capacity plan.
 _FEISHU_PROCESSING_REACTION_CACHE_SIZE = 1024
 
+_FEISHU_SILENT_SUCCESS_CODES = frozenset({230002})  # bot removed from chat → don't alarm
+_FEISHU_ACK_EMOJI = "OK"
+
 # QR onboarding constants
 _ONBOARD_ACCOUNTS_URLS = {
     "feishu": "https://accounts.feishu.cn",
@@ -382,8 +385,11 @@ class FeishuAdapterSettings:
     webhook_path: str
     ws_reconnect_nonce: int = 30
     ws_reconnect_interval: int = 120
-    ws_ping_interval: Optional[int] = None
-    ws_ping_timeout: Optional[int] = None
+    # CRITICAL FIX: Default ping interval was None (no heartbeat), causing
+    # silent WebSocket disconnects during long-running agent tasks.
+    # 20s ping / 10s timeout ensures the server detects stale connections.
+    ws_ping_interval: Optional[int] = 20
+    ws_ping_timeout: Optional[int] = 10
     admins: frozenset[str] = frozenset()
     default_group_policy: str = ""
     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
@@ -1683,6 +1689,20 @@ class FeishuAdapter(BasePlatformAdapter):
                     )
                 last_response = response
 
+            # Silently swallow "bot not in chat" — prevents cron ERROR spam when
+            # the bot has been removed from a group.  The user already knows
+            # (they removed it); no need to fill the logs.
+            if (
+                last_response
+                and getattr(last_response, "code", None) in _FEISHU_SILENT_SUCCESS_CODES
+            ):
+                logger.debug(
+                    "[Feishu] Bot not in chat %s (code %s); treating as silent success",
+                    chat_id,
+                    last_response.code,
+                )
+                return SendResult(success=True, raw_response=last_response)
+
             return self._finalize_send_result(last_response, "send failed")
         except Exception as exc:
             logger.error("[Feishu] Send error: %s", exc, exc_info=True)
@@ -2507,11 +2527,28 @@ class FeishuAdapter(BasePlatformAdapter):
         """Dispatch a single event through the agent pipeline with per-chat serialization
         before handing the event off to the agent.
 
-        Per-chat lock ensures messages in the same chat are processed one at a
-        time (matches openclaw's createChatQueue serial queue behaviour).
+        - Per-chat lock: ensures messages in the same chat are processed one at a time
+          (matches openclaw's createChatQueue serial queue behaviour).
+        - ACK indicator: adds a CHECK reaction to the triggering message before handing
+          off to the agent and leaves it in place as a receipt marker.
+        - Queue feedback: if another message is already being processed in this chat,
+          sends a "⏳ Queueing..." notice so the user knows the message was received.
         """
         chat_id = getattr(event.source, "chat_id", "") or "" if event.source else ""
         chat_lock = self._get_chat_lock(chat_id)
+        # CRITICAL FIX: Notify user when their message is queued behind a
+        # long-running task in the same chat. Without this, users think the
+        # bot is dead silent for minutes.
+        if chat_lock.locked():
+            try:
+                await self.send(
+                    chat_id,
+                    "⏳ Another message is still being processed in this chat. "
+                    "Your message has been queued and will be handled next.",
+                    metadata=getattr(event, "metadata", None),
+                )
+            except Exception:
+                pass
         async with chat_lock:
             await self.handle_message(event)
 

@@ -344,27 +344,36 @@ class ContextCompressor(ContextEngine):
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
         self.quiet_mode = quiet_mode
 
+        import time as _time
+        import logging as _logging
+        _logger = _logging.getLogger(__name__)
+        _logger.info("[DEBUG] ContextCompressor.__init__: start @ %s model=%s provider=%s", _time.strftime("%H:%M:%S"), model, provider)
         self.context_length = get_model_context_length(
             model, base_url=base_url, api_key=api_key,
             config_context_length=config_context_length,
             provider=provider,
         )
+        _logger.info("[DEBUG] ContextCompressor.__init__: get_model_context_length done @ %s", _time.strftime("%H:%M:%S"))
         # Floor: never compress below MINIMUM_CONTEXT_LENGTH tokens even if
         # the percentage would suggest a lower value.  This prevents premature
-        # compression on large-context models at 50% while keeping the % sane
+        # compression on large-context models at 50%% while keeping the %% sane
         # for models right at the minimum.
+        _logger.info("[DEBUG] ContextCompressor.__init__: calculating threshold_tokens @ %s", _time.strftime("%H:%M:%S"))
         self.threshold_tokens = max(
             int(self.context_length * threshold_percent),
             MINIMUM_CONTEXT_LENGTH,
         )
+        _logger.info("[DEBUG] ContextCompressor.__init__: threshold_tokens=%d done @ %s", self.threshold_tokens, _time.strftime("%H:%M:%S"))
         self.compression_count = 0
 
         # Derive token budgets: ratio is relative to the threshold, not total context
+        _logger.info("[DEBUG] ContextCompressor.__init__: calculating token budgets @ %s", _time.strftime("%H:%M:%S"))
         target_tokens = int(self.threshold_tokens * self.summary_target_ratio)
         self.tail_token_budget = target_tokens
         self.max_summary_tokens = min(
             int(self.context_length * 0.05), _SUMMARY_TOKENS_CEILING,
         )
+        _logger.info("[DEBUG] ContextCompressor.__init__: token budgets done @ %s", _time.strftime("%H:%M:%S"))
 
         if not quiet_mode:
             logger.info(
@@ -376,6 +385,7 @@ class ContextCompressor(ContextEngine):
                 self.tail_token_budget,
                 provider or "none", base_url or "none",
             )
+        _logger.info("[DEBUG] ContextCompressor.__init__: ALL DONE @ %s", _time.strftime("%H:%M:%S"))
         self._context_probed = False  # True after a step-down from context error
 
         self.last_prompt_tokens = 0

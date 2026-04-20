@@ -360,14 +360,36 @@ class MemoryManager:
         provider can resolve profile-scoped storage paths without importing
         ``get_hermes_home()`` themselves.
         """
+        import time as _time
+        import threading
+        _timeout_secs = 120.0  # MemPalace init can be slow on first run (ChromaDB restore)
+
         if "hermes_home" not in kwargs:
             from hermes_constants import get_hermes_home
             kwargs["hermes_home"] = str(get_hermes_home())
         for provider in self._providers:
-            try:
-                provider.initialize(session_id=session_id, **kwargs)
-            except Exception as e:
-                logger.warning(
-                    "Memory provider '%s' initialize failed: %s",
-                    provider.name, e,
-                )
+            _start = _time.time()
+            logger.warning("[DEBUG] MemoryManager initialize_all: starting provider '%s' @ %s", provider.name, _time.strftime("%H:%M:%S"))
+            _exc_info = [None]
+            _done = [False]
+
+            def _run_init():
+                try:
+                    provider.initialize(session_id=session_id, **kwargs)
+                except Exception as e:
+                    _exc_info[0] = e
+                finally:
+                    _done[0] = True
+
+            _t = threading.Thread(target=_run_init, daemon=True)
+            _t.start()
+            _t.join(timeout=_timeout_secs)
+            if _t.is_alive():
+                logger.warning("[DEBUG] MemoryManager: provider '%s' TIMED OUT after %.0fs — skipping", provider.name, _timeout_secs)
+                # Let the thread die; do NOT join forcefully
+            else:
+                if _exc_info[0]:
+                    logger.warning("Memory provider '%s' initialize failed: %s", provider.name, _exc_info[0])
+                else:
+                    logger.warning("[DEBUG] MemoryManager initialize_all: provider '%s' done in %.1fs @ %s", provider.name, _time.time() - _start, _time.strftime("%H:%M:%S"))
+        logger.warning("[DEBUG] MemoryManager initialize_all: ALL DONE @ %s", _time.strftime("%H:%M:%S"))

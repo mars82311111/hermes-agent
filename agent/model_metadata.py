@@ -255,6 +255,7 @@ _URL_TO_PROVIDER: Dict[str, str] = {
     "api.stepfun.com": "stepfun",
     "api.arcee.ai": "arcee",
     "api.minimax": "minimax",
+    "api.minimaxi.com": "minimax",
     "dashscope.aliyuncs.com": "alibaba",
     "dashscope-intl.aliyuncs.com": "alibaba",
     "portal.qwen.ai": "qwen-oauth",
