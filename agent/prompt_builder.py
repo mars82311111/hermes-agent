@@ -497,7 +497,28 @@ def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
     return manifest
 
 
-def _load_skills_snapshot(skills_dir: Path) -> Optional[dict]:
+def _build_skills_fingerprint(skills_dir: Path, external_dirs: list[Path]) -> tuple[int, int]:
+    """Return a lightweight fingerprint (file_count, max_mtime_ns) of all skill directories.
+
+    Used to invalidate the in-process LRU cache when skills are added, removed,
+    or modified — including manual file copies and external directory updates.
+    """
+    total_files = 0
+    max_mtime = 0
+    for directory in [skills_dir] + [d for d in external_dirs if d.exists()]:
+        for filename in ("SKILL.md", "DESCRIPTION.md"):
+            for path in iter_skill_index_files(directory, filename):
+                total_files += 1
+                try:
+                    st = path.stat()
+                    if st.st_mtime_ns > max_mtime:
+                        max_mtime = st.st_mtime_ns
+                except OSError:
+                    continue
+    return (total_files, max_mtime)
+
+
+def _load_skills_snapshot(skills_dir: Path, external_dirs: list[Path] | None = None) -> Optional[dict]:
     """Load the disk snapshot if it exists and its manifest still matches."""
     snapshot_path = _skills_prompt_snapshot_path()
     if not snapshot_path.exists():
@@ -512,6 +533,16 @@ def _load_skills_snapshot(skills_dir: Path) -> Optional[dict]:
         return None
     if snapshot.get("manifest") != _build_skills_manifest(skills_dir):
         return None
+    # Also validate external directories if present
+    external_dirs = external_dirs or []
+    stored_external = snapshot.get("external_manifests") or {}
+    for ext_dir in external_dirs:
+        if not ext_dir.exists():
+            continue
+        key = str(ext_dir.resolve())
+        current_manifest = _build_skills_manifest(ext_dir)
+        if stored_external.get(key) != current_manifest:
+            return None
     return snapshot
 
 
@@ -520,11 +551,17 @@ def _write_skills_snapshot(
     manifest: dict[str, list[int]],
     skill_entries: list[dict],
     category_descriptions: dict[str, str],
+    external_dirs: list[Path] | None = None,
 ) -> None:
     """Persist skill metadata to disk for fast cold-start reuse."""
+    external_manifests: dict[str, dict[str, list[int]]] = {}
+    for ext_dir in (external_dirs or []):
+        if ext_dir.exists():
+            external_manifests[str(ext_dir.resolve())] = _build_skills_manifest(ext_dir)
     payload = {
         "version": _SKILLS_SNAPSHOT_VERSION,
         "manifest": manifest,
+        "external_manifests": external_manifests,
         "skills": skill_entries,
         "category_descriptions": category_descriptions,
     }
@@ -709,7 +746,9 @@ def build_skills_system_prompt(
         or ""
     )
     disabled = get_disabled_skill_names()
+    skills_fingerprint = _build_skills_fingerprint(skills_dir, external_dirs)
     cache_key = (
+        skills_fingerprint,
         str(skills_dir.resolve()),
         tuple(str(d) for d in external_dirs),
         tuple(sorted(str(t) for t in (available_tools or set()))),
@@ -724,7 +763,7 @@ def build_skills_system_prompt(
             return cached
 
     # ── Layer 2: disk snapshot ────────────────────────────────────────
-    snapshot = _load_skills_snapshot(skills_dir)
+    snapshot = _load_skills_snapshot(skills_dir, external_dirs)
 
     skills_by_category: dict[str, list[tuple[str, str]]] = {}
     category_descriptions: dict[str, str] = {}
@@ -796,6 +835,7 @@ def build_skills_system_prompt(
             _build_skills_manifest(skills_dir),
             skill_entries,
             category_descriptions,
+            external_dirs,
         )
 
     # ── External skill directories ─────────────────────────────────────
@@ -937,9 +977,10 @@ def build_skills_system_prompt(
             "## Skills (mandatory)\n"
             "Before replying, scan the skills below using the THREE-STEP process:\n"
             "  STEP 1: Check the 高频工具 list — if your task matches, load that skill immediately.\n"
-            "  STEP 2: If not in 高频工具, use the 任务速查 to find the right category, "
-            "then call skills_list(category='xxx') to see all skills in that category.\n"
-            "  STEP 3: If still not found locally, search externally with clawhub search or find-skills.\n"
+            "  STEP 2: If not in 高频工具, call skill_search(query='任务关键词') first — "
+            "it searches both local and external skills by relevance.\n"
+            "  STEP 3: If skill_search returns insufficient results, use the 任务速查 to find "
+            "the right category, then call skills_list(category='xxx') to expand it.\n"
             "If a skill matches or is even partially relevant to your task, "
             "you MUST load it with skill_view(name) and follow its instructions. "
             "Err on the side of loading — it is always better to have context you don't need "
@@ -961,7 +1002,7 @@ def build_skills_system_prompt(
             "\n"
             "Only proceed without loading a skill if genuinely none are relevant to the task.\n"
             "\n"
-            "TIP: New skills are automatically discoverable via skills_list(). "
+            "TIP: New skills are automatically discoverable via skill_search() or skills_list(). "
             "If you can't find a suitable local skill, search external repositories with "
             "clawhub search or find-skills."
         )
