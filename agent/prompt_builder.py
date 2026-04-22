@@ -565,6 +565,92 @@ def _build_snapshot_entry(
 
 
 # =========================================================================
+# Tier-1 core skills (always shown in full in the system prompt)
+# =========================================================================
+
+# These ~55 skills are loaded into the system prompt on every turn.
+# All other skills are grouped by category with counts only.
+# This keeps the skills index compact (saves ~70% tokens) while ensuring
+# the most important skills are always visible.
+_TIER1_SKILL_NAMES: set[str] = {
+    # memory system (core)
+    "hermes-memory-architecture",
+    "hermes-memory-lancedb-repair",
+    "memory-mempalace-skill",
+    "memory-skill-workflow",
+    "hermes-memory-maintenance",
+    "hermes-memory-provider-maintenance",
+    "lancedb-memory-repair",
+    "mempalace-deep-audit",
+    "mempalace-root-cause-repair",
+    "memory-mempalace-patch",
+    "kg-workingmemory-wal-scope-users",
+    # hermes-agent system
+    "hermes-agent-systematic-debug",
+    "hermes-session-hang-debug",
+    "hermes-cron-memory-debug",
+    "hermes-context-compression-debug",
+    "hermes-context-loss-debug",
+    "hermes-endogenous-evolution-system",
+    "auto-retrospective-workflow",
+    "cron-memory-flush-fix",
+    "hermes-skills-prompt-optimization",
+    "hermes-model-context-fix",
+    "hermes-agent-restart",
+    "hermes-minimax-model-catalog-override",
+    # devops / system config
+    "feishu-gateway-setup",
+    "hermes-multi-provider-setup",
+    "hermes-provider-cleanup-and-routing-limits",
+    "hermes-safe-update",
+    "webhook-subscriptions",
+    "auto-devops-e60094fc",
+    "openclaw-security-upgrade",
+    "feishu-file-send-truncation",
+    # automation (most frequently used tools)
+    "camofox-douyin-access",
+    "ghost-os-control",
+    "x-post-from-logged-in-chrome",
+    "x-twitter-applescript-post",
+    "xiaohongshu-chrome-applescript-post",
+    "human-like-computer-control",
+    "clawhub-skill-full-install",
+    "cron-memory-consolidation-fix",
+    # messaging
+    "feishu-file-audio-send",
+    "openclaw-feishu-dm",
+    "openclaw-feishu-dm-direct",
+    "openclaw-feishu-multi-bot-dm",
+    # social-media
+    "x-twitter-post-macos",
+    "social-platform-login-check",
+    "xurl",
+    # software-development
+    "systematic-debugging",
+    "test-driven-development",
+    "writing-plans",
+    "subagent-driven-development",
+    "requesting-code-review",
+    "plan",
+    # skill management
+    "skill-problem-trigger-system",
+    "skill-proactive-discovery",
+    "clawhub-skill-exploration",
+    "clawhub-skill-inspection-workflow",
+    "agent-reflect",
+    "supervision-system-v3",
+    "auto-skill-distillation-pipeline",
+    # agent orchestration
+    "openclaw-agent-orchestration",
+    "openclaw-command-chains",
+    "openclaw-agent-cognitive-alignment",
+    # configuration
+    "kimi-api-key-types",
+    "kimi-coding-plan-config",
+    "hermes-vision-provider-setup",
+}
+
+# =========================================================================
 # Skills index
 # =========================================================================
 
@@ -795,23 +881,62 @@ def build_skills_system_prompt(
     if not skills_by_category:
         result = ""
     else:
-        index_lines = []
+        # ── Tiered skills index: core skills in full, others by category count ──
+        tier1_by_category: dict[str, list[str]] = {}
+        other_by_category: dict[str, list[str]] = {}
+
         for category in sorted(skills_by_category.keys()):
-            cat_desc = category_descriptions.get(category, "")
-            if cat_desc:
-                index_lines.append(f"  {category}: {cat_desc}")
-            else:
-                index_lines.append(f"  {category}:")
-            # Deduplicate and sort skills within each category
             seen = set()
-            for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
+            tier1_list: list[str] = []
+            other_list: list[str] = []
+            for name, _ in sorted(skills_by_category[category], key=lambda x: x[0]):
                 if name in seen:
                     continue
                 seen.add(name)
-                if desc:
-                    index_lines.append(f"    - {name}: {desc}")
+                if name in _TIER1_SKILL_NAMES:
+                    tier1_list.append(name)
                 else:
-                    index_lines.append(f"    - {name}")
+                    other_list.append(name)
+            if tier1_list:
+                tier1_by_category[category] = tier1_list
+            if other_list:
+                other_by_category[category] = other_list
+
+        index_lines = []
+        categories_with_tier1 = set(tier1_by_category.keys())
+
+        # Tier 1: core skills — shown in full
+        for category in sorted(tier1_by_category.keys()):
+            cat_desc = category_descriptions.get(category, "")
+            other_count = len(other_by_category.get(category, []))
+            if cat_desc:
+                if other_count:
+                    index_lines.append(f"  {category}: {cat_desc} (+{other_count} more)")
+                else:
+                    index_lines.append(f"  {category}: {cat_desc}")
+            else:
+                if other_count:
+                    index_lines.append(f"  {category}: (+{other_count} more)")
+                else:
+                    index_lines.append(f"  {category}:")
+            for name in tier1_by_category[category]:
+                index_lines.append(f"    - {name}")
+
+        # Tier 2: other categories — compact (name + count only)
+        other_only_categories = {
+            cat: skills for cat, skills in other_by_category.items()
+            if cat not in categories_with_tier1
+        }
+        if other_only_categories:
+            index_lines.append("")
+            index_lines.append("  # Additional categories — call skills_list() for full details:")
+            for category in sorted(other_only_categories.keys()):
+                cat_desc = category_descriptions.get(category, "")
+                count = len(other_only_categories[category])
+                if cat_desc:
+                    index_lines.append(f"  {category}: {cat_desc} ({count} skills)")
+                else:
+                    index_lines.append(f"  {category}: ({count} skills)")
 
         result = (
             "## Skills (mandatory)\n"
@@ -834,7 +959,10 @@ def build_skills_system_prompt(
             + "\n".join(index_lines) + "\n"
             "</available_skills>\n"
             "\n"
-            "Only proceed without loading a skill if genuinely none are relevant to the task."
+            "Only proceed without loading a skill if genuinely none are relevant to the task.\n"
+            "\n"
+            "For categories marked with counts above, call skills_list() to see the full list "
+            "of skills in that category."
         )
 
     # ── Store in LRU cache ────────────────────────────────────────────
