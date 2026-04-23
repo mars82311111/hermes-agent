@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "elon-musk-perspective": {
+      "source": "alchaincyf/elon-musk-skill",
+      "sourceType": "github",
+      "computedHash": "881824f40bb4fd6f8b84f069882b15c0539daae32c08c81aac64b3167ffb3d6f"
+    }
+  }
+}

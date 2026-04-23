@@ -43,6 +43,9 @@ def generate_title(user_message: str, assistant_response: str, timeout: float = 
             timeout=timeout,
         )
         title = (response.choices[0].message.content or "").strip()
+        # Strip reasoning tags (e.g. <think>...</think>) that some models return
+        import re
+        title = re.sub(r"<think>.*?</think>", "", title, flags=re.DOTALL).strip()
         # Clean up: remove quotes, trailing punctuation, prefixes like "Title: "
         title = title.strip('"\'')
         if title.lower().startswith("title:"):

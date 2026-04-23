@@ -10091,18 +10091,22 @@ class GatewayRunner:
                 message = (
                     f"[System note: Your previous turn in this session was interrupted "
                     f"by {_reason_phrase}. The conversation history below is intact. "
-                    f"If it contains unfinished tool result(s), process them first and "
-                    f"summarize what was accomplished, then address the user's new "
-                    f"message below.]\n\n"
+                    f"PRIORITIZE the user's new message below. If there are unfinished "
+                    f"tool results, briefly acknowledge them only if directly relevant; "
+                    f"otherwise focus entirely on the user's new message.]\n\n"
                     + message
                 )
             elif agent_history and agent_history[-1].get("role") == "tool":
+                # The user's new message takes priority. Briefly acknowledge any
+                # unfinished tool results only if they are directly relevant to the
+                # current request; otherwise focus entirely on the user's new message.
                 message = (
                     "[System note: Your previous turn was interrupted before you could "
                     "process the last tool result(s). The conversation history contains "
-                    "tool outputs you haven't responded to yet. Please finish processing "
-                    "those results and summarize what was accomplished, then address the "
-                    "user's new message below.]\n\n"
+                    "tool outputs you haven't responded to yet. PRIORITIZE the user's "
+                    "new message below. If the tool results are directly relevant, "
+                    "briefly summarize them first; if not, ignore them and respond to "
+                    "the user's message directly.]\n\n"
                     + message
                 )
 

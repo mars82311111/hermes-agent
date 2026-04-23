@@ -161,7 +161,7 @@ class TestTryActivateFallback:
 
     def test_activates_minimax_fallback(self):
         agent = _make_agent(
-            fallback_model={"provider": "minimax", "model": "MiniMax-M2.7"},
+            fallback_model={"provider": "minimax", "model": "MiniMax-M2.7-highspeed"},
         )
         mock_client = _mock_resolve(
             api_key="sk-mm-key",
@@ -169,10 +169,10 @@ class TestTryActivateFallback:
         )
         with patch(
             "agent.auxiliary_client.resolve_provider_client",
-            return_value=(mock_client, "MiniMax-M2.7"),
+            return_value=(mock_client, "MiniMax-M2.7-highspeed"),
         ):
             assert agent._try_activate_fallback() is True
-            assert agent.model == "MiniMax-M2.7"
+            assert agent.model == "MiniMax-M2.7-highspeed"
             assert agent.provider == "minimax"
             assert agent.client is mock_client
 
@@ -195,7 +195,7 @@ class TestTryActivateFallback:
     def test_returns_false_when_no_api_key(self):
         """Fallback should fail gracefully when the API key env var is unset."""
         agent = _make_agent(
-            fallback_model={"provider": "minimax", "model": "MiniMax-M2.7"},
+            fallback_model={"provider": "minimax", "model": "MiniMax-M2.7-highspeed"},
         )
         with patch(
             "agent.auxiliary_client.resolve_provider_client",

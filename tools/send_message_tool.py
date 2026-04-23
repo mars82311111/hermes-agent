@@ -447,10 +447,10 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
 
     # Smart-chunk the message to fit within platform limits.
     # For short messages or platforms without a known limit this is a no-op.
-    # Telegram measures length in UTF-16 code units, not Unicode codepoints.
+    # Telegram and Feishu measure length in UTF-16 code units, not Unicode codepoints.
     max_len = _MAX_LENGTHS.get(platform)
     if max_len:
-        _len_fn = utf16_len if platform == Platform.TELEGRAM else None
+        _len_fn = utf16_len if platform in {Platform.TELEGRAM, Platform.FEISHU} else None
         chunks = BasePlatformAdapter.truncate_message(message, max_len, len_fn=_len_fn)
     else:
         chunks = [message]

@@ -889,7 +889,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             disabled_toolsets=["cronjob", "messaging", "clarify"],
             quiet_mode=True,
             skip_context_files=True,  # Don't inject SOUL.md/AGENTS.md from scheduler cwd
-            skip_memory=True,  # Cron system prompts would corrupt user representations
+            skip_memory=not job.get("enable_memory", False),  # Allow memory for jobs that need it
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,

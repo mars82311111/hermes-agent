@@ -224,16 +224,10 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "kimi-k2-0905-preview",
     ],
     "minimax": [
-        "MiniMax-M2.7",
-        "MiniMax-M2.5",
-        "MiniMax-M2.1",
-        "MiniMax-M2",
+        "MiniMax-M2.7-highspeed",
     ],
     "minimax-cn": [
-        "MiniMax-M2.7",
-        "MiniMax-M2.5",
-        "MiniMax-M2.1",
-        "MiniMax-M2",
+        "MiniMax-M2.7-highspeed",
     ],
     "anthropic": [
         "claude-opus-4-7",
@@ -328,7 +322,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         # Third-party models available on coding-intl
         "glm-5",
         "glm-4.7",
-        "MiniMax-M2.5",
+        "MiniMax-M2.7-highspeed",
     ],
     # Curated HF model list — only agentic models that map to OpenRouter defaults.
     "huggingface": [
@@ -336,7 +330,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "Qwen/Qwen3.5-397B-A17B",
         "Qwen/Qwen3.5-35B-A3B",
         "deepseek-ai/DeepSeek-V3.2",
-        "MiniMaxAI/MiniMax-M2.5",
+        "MiniMaxAI/MiniMax-M2.7-highspeed",
         "zai-org/GLM-5",
         "XiaomiMiMo/MiMo-V2-Flash",
         "moonshotai/Kimi-K2-Thinking",

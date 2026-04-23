@@ -1051,6 +1051,14 @@ class HermesMemoryProvider:
             # Write to LanceDB
             stored = self._storage.store(entry)
 
+            # CRITICAL: Flush buffer immediately to ensure data is persisted
+            # LanceDB uses async buffering - without this flush, data may be lost
+            if self._storage and hasattr(self._storage, '_flush_buffer'):
+                try:
+                    self._storage._flush_buffer()
+                except Exception as e:
+                    logger.debug("Failed to flush storage buffer: %s", e)
+
             # Add to Working Memory (best-effort)
             if self._working_memory is not None:
                 try:

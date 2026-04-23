@@ -332,6 +332,19 @@ def _get_provider_models(provider: str) -> Optional[Dict[str, Any]]:
     if not mdev_provider_id:
         return None
 
+    # Hardcoded override for MiniMax providers: the live models.dev catalog
+    # still lists deprecated models (MiniMax-M2, etc.) that are no longer
+    # available on the Anthropic-compat endpoint.  Force the only working
+    # model so that alias resolution and catalog queries are correct.
+    if mdev_provider_id in ("minimax", "minimax-cn"):
+        return {
+            "MiniMax-M2.7-highspeed": {
+                "limit": {"context": 204800, "output": 131072},
+                "tool_call": True,
+                "reasoning": True,
+            }
+        }
+
     data = fetch_models_dev()
     provider_data = data.get(mdev_provider_id)
     if not isinstance(provider_data, dict):
