@@ -64,6 +64,12 @@ web/public/ds-assets/
 .release_notes.md
 mini-swe-agent/
 
+# Backup / temp files
+*.bak
+*.backup
+*.bak.*
+~*
+
 # Nix
 .direnv/
 .nix-stamps/
