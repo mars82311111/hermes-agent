@@ -1,5 +1,7 @@
 const BASE = "";
 
+import type { DashboardTheme } from "@/themes/types";
+
 // Ephemeral session token for protected endpoints.
 // Injected into index.html by the server — never fetched via API.
 declare global {
@@ -8,13 +10,20 @@ declare global {
   }
 }
 let _sessionToken: string | null = null;
+const SESSION_HEADER = "X-Hermes-Session-Token";
+
+function setSessionHeader(headers: Headers, token: string): void {
+  if (!headers.has(SESSION_HEADER)) {
+    headers.set(SESSION_HEADER, token);
+  }
+}
 
 export async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> {
   // Inject the session token into all /api/ requests.
   const headers = new Headers(init?.headers);
   const token = window.__HERMES_SESSION_TOKEN__;
-  if (token && !headers.has("Authorization")) {
-    headers.set("Authorization", `Bearer ${token}`);
+  if (token) {
+    setSessionHeader(headers, token);
   }
   const res = await fetch(`${BASE}${url}`, { ...init, headers });
   if (!res.ok) {
@@ -54,10 +63,20 @@ export const api = {
   },
   getAnalytics: (days: number) =>
     fetchJSON<AnalyticsResponse>(`/api/analytics/usage?days=${days}`),
+  getModelsAnalytics: (days: number) =>
+    fetchJSON<ModelsAnalyticsResponse>(`/api/analytics/models?days=${days}`),
   getConfig: () => fetchJSON<Record<string, unknown>>("/api/config"),
   getDefaults: () => fetchJSON<Record<string, unknown>>("/api/config/defaults"),
   getSchema: () => fetchJSON<{ fields: Record<string, unknown>; category_order: string[] }>("/api/config/schema"),
   getModelInfo: () => fetchJSON<ModelInfoResponse>("/api/model/info"),
+  getModelOptions: () => fetchJSON<ModelOptionsResponse>("/api/model/options"),
+  getAuxiliaryModels: () => fetchJSON<AuxiliaryModelsResponse>("/api/model/auxiliary"),
+  setModelAssignment: (body: ModelAssignmentRequest) =>
+    fetchJSON<ModelAssignmentResponse>("/api/model/set", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
   saveConfig: (config: Record<string, unknown>) =>
     fetchJSON<{ ok: boolean }>("/api/config", {
       method: "PUT",
@@ -90,7 +109,7 @@ export const api = {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
+        [SESSION_HEADER]: token,
       },
       body: JSON.stringify({ key }),
     });
@@ -112,6 +131,47 @@ export const api = {
     fetchJSON<{ ok: boolean }>(`/api/cron/jobs/${id}/trigger`, { method: "POST" }),
   deleteCronJob: (id: string) =>
     fetchJSON<{ ok: boolean }>(`/api/cron/jobs/${id}`, { method: "DELETE" }),
+
+  // Profiles (minimal)
+  getProfiles: () =>
+    fetchJSON<{ profiles: ProfileInfo[] }>("/api/profiles"),
+  createProfile: (body: { name: string; clone_from_default: boolean }) =>
+    fetchJSON<{ ok: boolean; name: string; path: string }>("/api/profiles", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  renameProfile: (name: string, newName: string) =>
+    fetchJSON<{ ok: boolean; name: string; path: string }>(
+      `/api/profiles/${encodeURIComponent(name)}`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ new_name: newName }),
+      },
+    ),
+  deleteProfile: (name: string) =>
+    fetchJSON<{ ok: boolean }>(
+      `/api/profiles/${encodeURIComponent(name)}`,
+      { method: "DELETE" },
+    ),
+  getProfileSetupCommand: (name: string) =>
+    fetchJSON<{ command: string }>(
+      `/api/profiles/${encodeURIComponent(name)}/setup-command`,
+    ),
+  getProfileSoul: (name: string) =>
+    fetchJSON<{ content: string; exists: boolean }>(
+      `/api/profiles/${encodeURIComponent(name)}/soul`,
+    ),
+  updateProfileSoul: (name: string, content: string) =>
+    fetchJSON<{ ok: boolean }>(
+      `/api/profiles/${encodeURIComponent(name)}/soul`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content }),
+      },
+    ),
 
   // Skills & Toolsets
   getSkills: () => fetchJSON<SkillInfo[]>("/api/skills"),
@@ -136,7 +196,7 @@ export const api = {
       `/api/providers/oauth/${encodeURIComponent(providerId)}`,
       {
         method: "DELETE",
-        headers: { Authorization: `Bearer ${token}` },
+        headers: { [SESSION_HEADER]: token },
       },
     );
   },
@@ -148,7 +208,7 @@ export const api = {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
+          [SESSION_HEADER]: token,
         },
         body: "{}",
       },
@@ -162,7 +222,7 @@ export const api = {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
+          [SESSION_HEADER]: token,
         },
         body: JSON.stringify({ session_id: sessionId, code }),
       },
@@ -178,7 +238,7 @@ export const api = {
       `/api/providers/oauth/sessions/${encodeURIComponent(sessionId)}`,
       {
         method: "DELETE",
-        headers: { Authorization: `Bearer ${token}` },
+        headers: { [SESSION_HEADER]: token },
       },
     );
   },
@@ -361,6 +421,56 @@ export interface AnalyticsResponse {
   };
 }
 
+export interface ProfileInfo {
+  name: string;
+  path: string;
+  is_default: boolean;
+  model: string | null;
+  provider: string | null;
+  has_env: boolean;
+  skill_count: number;
+}
+
+export interface ModelsAnalyticsModelEntry {
+  model: string;
+  provider: string;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  reasoning_tokens: number;
+  estimated_cost: number;
+  actual_cost: number;
+  sessions: number;
+  api_calls: number;
+  tool_calls: number;
+  last_used_at: number;
+  avg_tokens_per_session: number;
+  capabilities: {
+    supports_tools?: boolean;
+    supports_vision?: boolean;
+    supports_reasoning?: boolean;
+    context_window?: number;
+    max_output_tokens?: number;
+    model_family?: string;
+  };
+}
+
+export interface ModelsAnalyticsResponse {
+  models: ModelsAnalyticsModelEntry[];
+  totals: {
+    distinct_models: number;
+    total_input: number;
+    total_output: number;
+    total_cache_read: number;
+    total_reasoning: number;
+    total_estimated_cost: number;
+    total_actual_cost: number;
+    total_sessions: number;
+    total_api_calls: number;
+  };
+  period_days: number;
+}
+
 export interface CronJob {
   id: string;
   name?: string;
@@ -420,6 +530,54 @@ export interface ModelInfoResponse {
     max_output_tokens?: number;
     model_family?: string;
   };
+}
+
+// ── Model options / assignment types ──────────────────────────────────
+
+export interface ModelOptionProvider {
+  name: string;
+  slug: string;
+  models?: string[];
+  total_models?: number;
+  is_current?: boolean;
+  is_user_defined?: boolean;
+  source?: string;
+  warning?: string;
+}
+
+export interface ModelOptionsResponse {
+  model?: string;
+  provider?: string;
+  providers?: ModelOptionProvider[];
+}
+
+export interface AuxiliaryTaskAssignment {
+  task: string;
+  provider: string;
+  model: string;
+  base_url: string;
+}
+
+export interface AuxiliaryModelsResponse {
+  tasks: AuxiliaryTaskAssignment[];
+  main: { provider: string; model: string };
+}
+
+export interface ModelAssignmentRequest {
+  scope: "main" | "auxiliary";
+  provider: string;
+  model: string;
+  /** For auxiliary: task slot name, "" for all, "__reset__" to reset all. */
+  task?: string;
+}
+
+export interface ModelAssignmentResponse {
+  ok: boolean;
+  scope?: string;
+  provider?: string;
+  model?: string;
+  tasks?: string[];
+  reset?: boolean;
 }
 
 // ── OAuth provider types ────────────────────────────────────────────────
@@ -486,6 +644,9 @@ export interface DashboardThemeSummary {
   description: string;
   label: string;
   name: string;
+  /** Full theme definition for user themes; undefined for built-ins
+   *  (which the frontend already has locally). */
+  definition?: DashboardTheme;
 }
 
 export interface DashboardThemesResponse {
@@ -501,7 +662,12 @@ export interface PluginManifestResponse {
   description: string;
   icon: string;
   version: string;
-  tab: { path: string; position: string };
+  tab: {
+    path: string;
+    position?: string;
+    override?: string;
+    hidden?: boolean;
+  };
   entry: string;
   css?: string | null;
   has_api: boolean;

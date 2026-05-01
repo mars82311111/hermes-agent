@@ -23,6 +23,7 @@ const sidebars: SidebarsConfig = {
         'user-guide/cli',
         'user-guide/tui',
         'user-guide/configuration',
+        'user-guide/configuring-models',
         'user-guide/sessions',
         'user-guide/profiles',
         'user-guide/git-worktrees',
@@ -44,6 +45,7 @@ const sidebars: SidebarsConfig = {
           items: [
             'user-guide/features/tools',
             'user-guide/features/skills',
+            'user-guide/features/curator',
             'user-guide/features/memory',
             'user-guide/features/memory-providers',
             'user-guide/features/context-files',
@@ -60,6 +62,8 @@ const sidebars: SidebarsConfig = {
           items: [
             'user-guide/features/cron',
             'user-guide/features/delegation',
+            'user-guide/features/kanban',
+            'user-guide/features/kanban-tutorial',
             'user-guide/features/code-execution',
             'user-guide/features/hooks',
             'user-guide/features/batch-processing',
@@ -81,7 +85,7 @@ const sidebars: SidebarsConfig = {
           label: 'Management',
           items: [
             'user-guide/features/web-dashboard',
-            'user-guide/features/dashboard-plugins',
+            'user-guide/features/extending-the-dashboard',
           ],
         },
         {
@@ -89,14 +93,16 @@ const sidebars: SidebarsConfig = {
           label: 'Advanced',
           items: [
             'user-guide/features/rl-training',
+            'user-guide/features/spotify',
           ],
         },
         {
           type: 'category',
           label: 'Skills',
+          collapsed: true,
           items: [
-            'user-guide/skills/godmode',
-            'user-guide/skills/google-workspace',
+            'reference/skills-catalog',
+            'reference/optional-skills-catalog',
           ],
         },
       ],
@@ -124,6 +130,7 @@ const sidebars: SidebarsConfig = {
         'user-guide/messaging/weixin',
         'user-guide/messaging/bluebubbles',
         'user-guide/messaging/qqbot',
+        'user-guide/messaging/yuanbao',
         'user-guide/messaging/open-webui',
         'user-guide/messaging/webhooks',
       ],
@@ -167,6 +174,7 @@ const sidebars: SidebarsConfig = {
         'guides/webhook-github-pr-review',
         'guides/migrate-from-openclaw',
         'guides/aws-bedrock',
+        'guides/azure-foundry',
       ],
     },
     {
@@ -225,6 +233,7 @@ const sidebars: SidebarsConfig = {
         'reference/tools-reference',
         'reference/toolsets-reference',
         'reference/mcp-config-reference',
+        'reference/model-catalog',
         'reference/skills-catalog',
         'reference/optional-skills-catalog',
         'reference/faq',

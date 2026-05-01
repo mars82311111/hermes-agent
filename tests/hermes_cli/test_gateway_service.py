@@ -14,6 +14,26 @@ from gateway.restart import (
 )
 
 
+class TestUserSystemdPrivateSocketPreflight:
+    def test_preflight_accepts_private_socket_without_dbus_bus(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "_ensure_user_systemd_env", lambda: None)
+        monkeypatch.setattr(gateway_cli, "_user_dbus_socket_path", lambda: Path("/tmp/missing-bus"))
+        monkeypatch.setattr(gateway_cli, "_user_systemd_private_socket_path", lambda: Path("/tmp/private-socket"))
+        monkeypatch.setattr(Path, "exists", lambda self: str(self) == "/tmp/private-socket")
+
+        gateway_cli._preflight_user_systemd(auto_enable_linger=False)
+
+    def test_wait_for_user_dbus_socket_accepts_private_socket(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(gateway_cli, "_ensure_user_systemd_env", lambda: calls.append("env"))
+        monkeypatch.setattr(gateway_cli, "_user_dbus_socket_path", lambda: Path("/tmp/missing-bus"))
+        monkeypatch.setattr(gateway_cli, "_user_systemd_private_socket_path", lambda: Path("/tmp/private-socket"))
+        monkeypatch.setattr(Path, "exists", lambda self: str(self) == "/tmp/private-socket")
+
+        assert gateway_cli._wait_for_user_dbus_socket(timeout=0.1) is True
+        assert calls == ["env"]
+
+
 class TestSystemdServiceRefresh:
     def test_systemd_install_repairs_outdated_unit_without_force(self, tmp_path, monkeypatch):
         unit_path = tmp_path / "hermes-gateway.service"
@@ -95,7 +115,10 @@ class TestGeneratedSystemdUnits:
         assert "ExecStop=" not in unit
         assert "ExecReload=/bin/kill -USR1 $MAINPID" in unit
         assert f"RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}" in unit
-        assert "TimeoutStopSec=60" in unit
+        # TimeoutStopSec must exceed the default drain_timeout (60s) so
+        # systemd doesn't SIGKILL the cgroup before post-interrupt cleanup
+        # (tool subprocess kill, adapter disconnect) runs — issue #8202.
+        assert "TimeoutStopSec=90" in unit
 
     def test_user_unit_includes_resolved_node_directory_in_path(self, monkeypatch):
         monkeypatch.setattr(gateway_cli.shutil, "which", lambda cmd: "/home/test/.nvm/versions/node/v24.14.0/bin/node" if cmd == "node" else None)
@@ -111,7 +134,10 @@ class TestGeneratedSystemdUnits:
         assert "ExecStop=" not in unit
         assert "ExecReload=/bin/kill -USR1 $MAINPID" in unit
         assert f"RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}" in unit
-        assert "TimeoutStopSec=60" in unit
+        # TimeoutStopSec must exceed the default drain_timeout (60s) so
+        # systemd doesn't SIGKILL the cgroup before post-interrupt cleanup
+        # (tool subprocess kill, adapter disconnect) runs — issue #8202.
+        assert "TimeoutStopSec=90" in unit
         assert "WantedBy=multi-user.target" in unit
 
 
@@ -229,7 +255,8 @@ class TestLaunchdServiceRecovery:
         target = f"{domain}/{label}"
 
         def fake_run(cmd, check=False, **kwargs):
-            calls.append(cmd)
+            if cmd and cmd[0] == "launchctl":
+                calls.append(cmd)
             if cmd == ["launchctl", "kickstart", target] and calls.count(cmd) == 1:
                 raise gateway_cli.subprocess.CalledProcessError(3, cmd, stderr="Could not find service")
             return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -256,7 +283,8 @@ class TestLaunchdServiceRecovery:
         target = f"{domain}/{label}"
 
         def fake_run(cmd, check=False, **kwargs):
-            calls.append(cmd)
+            if cmd and cmd[0] == "launchctl":
+                calls.append(cmd)
             if cmd == ["launchctl", "kickstart", target] and calls.count(cmd) == 1:
                 raise gateway_cli.subprocess.CalledProcessError(113, cmd, stderr="Could not find service")
             return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -1099,6 +1127,10 @@ class TestPreflightUserSystemd:
             gateway_cli, "_user_dbus_socket_path",
             lambda: type("P", (), {"exists": lambda self: True})(),
         )
+        monkeypatch.setattr(
+            gateway_cli, "_user_systemd_private_socket_path",
+            lambda: type("P", (), {"exists": lambda self: False})(),
+        )
         # Should not raise, no subprocess calls needed.
         gateway_cli._preflight_user_systemd()
 
@@ -1106,6 +1138,10 @@ class TestPreflightUserSystemd:
         """Rick's scenario: no D-Bus, no linger, non-root SSH → clear error."""
         monkeypatch.setattr(
             gateway_cli, "_user_dbus_socket_path",
+            lambda: type("P", (), {"exists": lambda self: False})(),
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_user_systemd_private_socket_path",
             lambda: type("P", (), {"exists": lambda self: False})(),
         )
         monkeypatch.setattr(
@@ -1137,6 +1173,10 @@ class TestPreflightUserSystemd:
             lambda: type("P", (), {"exists": lambda self: False})(),
         )
         monkeypatch.setattr(
+            gateway_cli, "_user_systemd_private_socket_path",
+            lambda: type("P", (), {"exists": lambda self: False})(),
+        )
+        monkeypatch.setattr(
             gateway_cli, "get_systemd_linger_status",
             lambda: (None, "loginctl not found"),
         )
@@ -1151,6 +1191,10 @@ class TestPreflightUserSystemd:
         """Edge case: linger says yes but the bus socket never came up."""
         monkeypatch.setattr(
             gateway_cli, "_user_dbus_socket_path",
+            lambda: type("P", (), {"exists": lambda self: False})(),
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_user_systemd_private_socket_path",
             lambda: type("P", (), {"exists": lambda self: False})(),
         )
         monkeypatch.setattr(
@@ -1169,6 +1213,10 @@ class TestPreflightUserSystemd:
         """Happy remediation path: polkit allows enable-linger, socket spawns."""
         monkeypatch.setattr(
             gateway_cli, "_user_dbus_socket_path",
+            lambda: type("P", (), {"exists": lambda self: False})(),
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_user_systemd_private_socket_path",
             lambda: type("P", (), {"exists": lambda self: False})(),
         )
         monkeypatch.setattr(
