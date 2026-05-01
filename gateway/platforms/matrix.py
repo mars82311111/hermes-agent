@@ -95,6 +95,7 @@ from gateway.platforms.base import (
     MessageType,
     ProcessingOutcome,
     SendResult,
+    DEFAULT_HTTPX_LIMITS,
 )
 from gateway.platforms.helpers import ThreadParticipationTracker
 
@@ -895,7 +896,7 @@ class MatrixAdapter(BasePlatformAdapter):
             except ImportError:
                 import httpx
 
-                async with httpx.AsyncClient() as http:
+                async with httpx.AsyncClient(limits=DEFAULT_HTTPX_LIMITS) as http:
                     resp = await http.get(image_url, follow_redirects=True, timeout=30)
                     resp.raise_for_status()
                     data = resp.content

@@ -15,6 +15,7 @@ import re
 import socket as _socket
 import subprocess
 import sys
+import time
 import uuid
 from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
@@ -22,6 +23,19 @@ from urllib.parse import urlsplit
 from utils import normalize_proxy_url
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Shared HTTP client limits — prevents connection-storm fd exhaustion
+# when DNS or network is flaky (macOS mDNSResponder bug, etc.)
+# ---------------------------------------------------------------------------
+try:
+    import httpx as _httpx_module
+    DEFAULT_HTTPX_LIMITS = _httpx_module.Limits(
+        max_connections=20,
+        max_keepalive_connections=5,
+    )
+except Exception:
+    DEFAULT_HTTPX_LIMITS = None  # type: ignore[misc]
 
 
 def utf16_len(s: str) -> int:
@@ -400,6 +414,7 @@ async def cache_image_from_url(url: str, ext: str = ".jpg", retries: int = 2) ->
         timeout=30.0,
         follow_redirects=True,
         event_hooks={"response": [_ssrf_redirect_guard]},
+        limits=DEFAULT_HTTPX_LIMITS,
     ) as client:
         for attempt in range(retries + 1):
             try:
@@ -514,6 +529,7 @@ async def cache_audio_from_url(url: str, ext: str = ".ogg", retries: int = 2) ->
         timeout=30.0,
         follow_redirects=True,
         event_hooks={"response": [_ssrf_redirect_guard]},
+        limits=DEFAULT_HTTPX_LIMITS,
     ) as client:
         for attempt in range(retries + 1):
             try:

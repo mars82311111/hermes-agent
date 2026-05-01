@@ -1346,7 +1346,6 @@ def _extract_relevant_content(
             "task": "web_extract",
             "messages": [{"role": "user", "content": extraction_prompt}],
             "max_tokens": 4000,
-            "temperature": 0.6,  # MiniMax-M2.7-highspeed requires 0.6
         }
         model = _get_extraction_model()
         if model:

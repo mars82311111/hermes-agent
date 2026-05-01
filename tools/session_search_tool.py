@@ -229,9 +229,7 @@ async def _summarize_session(
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                temperature=0.6,  # MiniMax-M2.7-highspeed only accepts 0.6
                 max_tokens=MAX_SUMMARY_TOKENS,
-                provider="minimax-cn",  # Explicit to trigger temperature clamping in _build_call_kwargs
             )
             content = extract_content_or_reasoning(response)
             if content:

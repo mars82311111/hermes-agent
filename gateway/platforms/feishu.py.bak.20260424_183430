@@ -139,7 +139,6 @@ from gateway.platforms.base import (
     cache_audio_from_bytes,
     cache_image_from_bytes,
     utf16_len,
-    DEFAULT_HTTPX_LIMITS,
 )
 from gateway.status import acquire_scoped_lock, release_scoped_lock
 from hermes_constants import get_hermes_home
@@ -395,8 +394,6 @@ class FeishuAdapterSettings:
     admins: frozenset[str] = frozenset()
     default_group_policy: str = ""
     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
-    # When set to "card", ALL plain-text messages are wrapped in an interactive card
-    message_mode: str = "text"
 
 
 @dataclass
@@ -1467,7 +1464,6 @@ class FeishuAdapter(BasePlatformAdapter):
             admins=admins,
             default_group_policy=default_group_policy,
             group_rules=group_rules,
-            message_mode=str(extra.get("message_mode", os.getenv("HERMES_FEISHU_MESSAGE_MODE", "text"))).strip().lower(),
         )
 
     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
@@ -1498,7 +1494,6 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_reconnect_interval = settings.ws_reconnect_interval
         self._ws_ping_interval = settings.ws_ping_interval
         self._ws_ping_timeout = settings.ws_ping_timeout
-        self._message_mode = settings.message_mode
 
     def _build_event_handler(self) -> Any:
         if EventDispatcherHandler is None:
@@ -1660,100 +1655,17 @@ class FeishuAdapter(BasePlatformAdapter):
         content: str,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
-        force_text: bool = False,
     ) -> SendResult:
         """Send a Feishu message.
         
-        Auto-detects card JSON and sends as interactive card if detected.
         P0 Fix: Uses UTF-16 length calculation for accurate emoji counting.
         P0 Fix: Respects message-type-specific length limits (text=4096, post=10000).
         P2 Fix: Auto-converts extremely long messages to file attachments.
-        
-        Args:
-            force_text: If True, sends as plain text even when message_mode="card".
-                        Used for scroll messages that need to be editable.
         """
         if not self._client:
             return SendResult(success=False, error="Not connected")
-        
-        # Auto-detect card JSON
-        if content and content.strip().startswith('{'):
-            try:
-                msg_data = json.loads(content)
-                if 'percent' in msg_data or 'steps' in msg_data or 'level' in msg_data or 'buttons' in msg_data:
-                    # This is card data, send as interactive card
-                    import sys
-                    sys.path.insert(0, '/Users/mars/.hermes/skills/feishu-card-designer/scripts')
-                    from feishu_card_builder import build_card
-
-                    if 'percent' in msg_data or 'steps' in msg_data:
-                        card_type = "progress"
-                    elif 'level' in msg_data:
-                        card_type = "notification"
-                    elif 'buttons' in msg_data:
-                        card_type = "approval"
-                    else:
-                        card_type = "status"
-
-                    card = build_card(card_type, msg_data)
-                    return await self.send_card(chat_id, card, reply_to=reply_to, metadata=metadata)
-            except (json.JSONDecodeError, ValueError):
-                pass
 
         formatted = self.format_message(content)
-
-        # Check if there's an active scroll card for this chat_id
-        # If so, accumulate the message in the scroll card instead of sending directly
-        try:
-            import sys as _sys
-            _sys.path.insert(0, '/Users/mars/.hermes/scripts')
-            from feishu_scroll_card import scroll_card_manager
-            
-            # Reload state to get latest cards
-            scroll_card_manager._reload_state()
-            
-            # Check for active scroll card for this chat_id
-            for _cid, _cstate in scroll_card_manager._cards.items():
-                if _cstate.get("chat_id") == chat_id and _cstate.get("status") in ("running", "pending"):
-                    # Found active scroll card - accumulate message instead of sending
-                    _step_name = "📨 回复"
-                    scroll_card_manager.append_step(_cid, _step_name, content)
-                    # Update the card in background thread
-                    _payload = scroll_card_manager.build_update_payload(_cid)
-                    if _payload and _payload.get("message_id"):
-                        import json as _json
-                        _card_json = _json.dumps(_payload["card"], ensure_ascii=False)
-                        from lark_oapi.api.im.v1 import PatchMessageRequest, PatchMessageRequestBody
-                        _request = PatchMessageRequest.builder() \
-                            .message_id(_payload["message_id"]) \
-                            .request_body(PatchMessageRequestBody.builder()
-                                .content(_card_json)
-                                .build()) \
-                            .build()
-                        # Run in thread to not block async send
-                        import threading
-                        def _patch_card():
-                            try:
-                                self._client.im.v1.message.patch(_request)
-                            except Exception:
-                                pass
-                        threading.Thread(target=_patch_card, daemon=True).start()
-                    return SendResult(success=True, message_id=_payload.get("message_id") if _payload else None)
-        except Exception:
-            pass  # Fall through to normal send if scroll card check fails
-
-        # When message_mode=="card", wrap all plain-text messages in an interactive card
-        # Skip card wrapping if force_text=True (for scroll messages that need editing)
-        if self._message_mode == "card" and not force_text:
-            card = {
-                "config": {"wide_screen_mode": True},
-                "header": {
-                    "title": {"content": "消息", "tag": "plain_text"},
-                    "template": "blue"
-                },
-                "elements": [{"tag": "markdown", "content": formatted}]
-            }
-            return await self.send_card(chat_id, card, reply_to=reply_to, metadata=metadata)
         
         # P2: Check if message is extremely long and should be sent as file
         if utf16_len(formatted) > self._MESSAGE_FILE_THRESHOLD:
@@ -2198,76 +2110,6 @@ class FeishuAdapter(BasePlatformAdapter):
             return self._finalize_send_result(message_response, "image send failed")
         except Exception as exc:
             logger.error("[Feishu] Failed to send image %s: %s", image_path, exc, exc_info=True)
-            return SendResult(success=False, error=str(exc))
-
-    async def send_card(
-        self,
-        chat_id: str,
-        card: Dict[str, Any],
-        reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> SendResult:
-        """Send an interactive card message to Feishu.
-        
-        Args:
-            chat_id: Target chat ID
-            card: Feishu card dict (config/header/elements structure)
-            reply_to: Optional message ID to reply to
-            metadata: Optional metadata dict
-        
-        Returns:
-            SendResult with message_id on success
-        """
-        if not self._client:
-            return SendResult(success=False, error="Not connected")
-        
-        try:
-            payload = json.dumps(card, ensure_ascii=False)
-            response = await self._feishu_send_with_retry(
-                chat_id=chat_id,
-                msg_type="interactive",
-                payload=payload,
-                reply_to=reply_to,
-                metadata=metadata,
-            )
-            return self._finalize_send_result(response, "card send failed")
-        except Exception as exc:
-            logger.error("[Feishu] Failed to send card: %s", exc, exc_info=True)
-            return SendResult(success=False, error=str(exc))
-
-    async def update_card(
-        self,
-        message_id: str,
-        card: Dict[str, Any],
-    ) -> SendResult:
-        """Update a previously sent interactive card.
-        
-        Uses PATCH method (PatchMessageRequest) as required by Feishu API.
-        The card content is passed directly as JSON without msg_type wrapper.
-        
-        Args:
-            message_id: The message_id of the card to update
-            card: New card content dict
-        
-        Returns:
-            SendResult with success status
-        """
-        if not self._client:
-            return SendResult(success=False, error="Not connected")
-        
-        try:
-            payload = json.dumps(card, ensure_ascii=False)
-            # Use PatchMessageRequestBody (only needs content, not msg_type)
-            from lark_oapi.api.im.v1 import PatchMessageRequest, PatchMessageRequestBody
-            body = PatchMessageRequestBody.builder().content(payload).build()
-            request = PatchMessageRequest.builder().message_id(message_id).request_body(body).build()
-            response = await asyncio.to_thread(self._client.im.v1.message.patch, request)
-            result = self._finalize_send_result(response, "card update failed")
-            if result.success:
-                result.message_id = message_id
-            return result
-        except Exception as exc:
-            logger.error("[Feishu] Failed to update card %s: %s", message_id, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
@@ -3202,7 +3044,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
         import httpx
 
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, limits=DEFAULT_HTTPX_LIMITS) as client:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
             response = await client.get(
                 file_url,
                 headers={

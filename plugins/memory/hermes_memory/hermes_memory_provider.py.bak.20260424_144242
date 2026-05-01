@@ -59,7 +59,7 @@ try:
     from .wal_manager import WALManager
     from .smart_extractor import smart_extract, queue_extraction
     from .noise_filter import is_noise
-    from .adaptive_retrieval import should_skip_retrieval, should_confirm_intent, build_intent_confirmation_card
+    from .adaptive_retrieval import should_skip_retrieval
     from .scope_isolation import Scope, can_access, ScopeGuard
 except ImportError as e:
     logger.warning("Failed to import some components: %s", e)
@@ -234,23 +234,9 @@ class HermesMemoryProvider:
 
         Searches both the current session scope (if session_id is provided)
         and the global scope, merging results for comprehensive recall.
-        
-        INTENT GATE (2026-05-01): If query contains ambiguous keywords,
-        return a confirmation prompt instead of executing retrieval.
         """
         if not self._initialized:
             return ""
-        
-        # INTENT GATE: Check if query needs user confirmation before retrieval
-        # This prevents retrieving wrong memories due to ambiguous keywords
-        if should_confirm_intent(query):
-            confirmation_msg = build_intent_confirmation_card(query)
-            if confirmation_msg:
-                # Return special prefix that signals "needs user confirmation"
-                # The agent/gateway will detect this and prompt the user
-                logger.info("Intent gate triggered for query: %s", query[:50])
-                return f"[INTENT_CONFIRMATION_NEEDED]\n{confirmation_msg}"
-        
         try:
             all_results = []
             # Search session scope first (more relevant)
@@ -281,97 +267,17 @@ class HermesMemoryProvider:
         """Queue background recall for the next turn."""
         pass  # We do synchronous prefetch, no background needed
 
-    # =========================================================================
-    # Auto-extraction rules for key facts (system-level, no LLM judgment needed)
-    # =========================================================================
-
-    _AUTO_EXTRACT_RULES = [
-        # (regex_pattern, category, importance, description)
-        (r'我(?:喜欢|偏好|习惯|讨厌|不要|希望|期望|想要|想|需要)',
-         'user_preference', 0.9, 'user preference'),
-        (r'(?:决定|选择|采用|确认使用|定为|设为|用|使用)\s*\S+',
-         'decision', 0.9, 'decision'),
-        (r'(?:不是|错了|纠正|应该|不应该|记住.*不要|别再|以后.*要|以后.*不要)',
-         'lesson', 0.95, 'correction/lesson'),
-        (r'(?:项目|状态|完成|进行中|阻塞|下一步|待办|已做|做完)',
-         'project_status', 0.85, 'project status'),
-        (r'(?:配置|设置|参数|路径|端口|版本|安装|环境)',
-         'system_config', 0.85, 'system config'),
-        (r'(?:归.*管|边界|授权|权限|负责|属于)',
-         'boundary', 0.9, 'boundary/ownership'),
-        (r'(?:密码|账号|token|key|api|密钥)',
-         'credential', 0.95, 'credential'),
-        (r'(?:风险|问题|bug|故障|错误|异常|警告)',
-         'issue', 0.9, 'issue/risk'),
-        (r'(?:授权|允许|同意|确认|批准)',
-         'authorization', 0.9, 'authorization'),
-    ]
-
-    @staticmethod
-    def _extract_key_sentences(text: str, pattern: str, max_sentences: int = 2) -> list:
-        """Extract sentences matching the given regex pattern."""
-        import re
-        sentences = re.split(r'[。！？\n]', text)
-        matches = []
-        for s in sentences:
-            s = s.strip()
-            if s and re.search(pattern, s):
-                matches.append(s)
-                if len(matches) >= max_sentences:
-                    break
-        return matches
-
-    def _auto_extract_and_store(self, text: str, scope: str = "global") -> None:
-        """Auto-extract key facts from text using rule engine and store to hermes_memory.
-
-        This is a system-level mechanism: no LLM judgment needed.
-        Rules are deterministic and stable.
-        """
-        import re
-        for pattern, category, importance, desc in self._AUTO_EXTRACT_RULES:
-            if re.search(pattern, text):
-                sentences = self._extract_key_sentences(text, pattern)
-                for sentence in sentences:
-                    # Skip if too short or too long
-                    if len(sentence) < 5 or len(sentence) > 300:
-                        continue
-                    # Deduplication: check if similar content already exists
-                    try:
-                        existing = self.search(query=sentence, limit=3, scope=scope)
-                        if any(sentence[:30] in (r.get("text", "")[:50] or "") for r in existing):
-                            continue  # Skip duplicate
-                    except Exception:
-                        pass  # If search fails, still store
-                    try:
-                        self.store(
-                            text=f"[{desc}] {sentence}",
-                            category=category,
-                            importance=importance,
-                            scope=scope,
-                            metadata={
-                                "auto_extracted": True,
-                                "extractor": "rule_engine",
-                                "source_text_preview": text[:100],
-                            }
-                        )
-                    except Exception as e:
-                        logger.debug("auto_extract store failed for %s: %s", desc, e)
-
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Persist a completed turn to the backend.
 
         OPTIMIZATION: Uses session_id as scope for session-isolated storage.
         Falls back to 'global' if session_id is empty.
-
-        CRITICAL: Auto-extracts key facts from user_content using rule engine
-        and stores them with high importance. This is a system-level mechanism
-        that does NOT depend on LLM judgment.
         """
         if not self._initialized:
             return
         try:
             scope = session_id if session_id else "global"
-            # Store user message (raw conversation)
+            # Store user message
             if user_content.strip():
                 self.store(
                     text=user_content,
@@ -381,9 +287,7 @@ class HermesMemoryProvider:
                     role="user",
                     speaker="user",
                 )
-                # AUTO-EXTRACT: System-level key fact extraction
-                self._auto_extract_and_store(user_content, scope=scope)
-            # Store assistant response (raw conversation)
+            # Store assistant response
             if assistant_content.strip():
                 self.store(
                     text=assistant_content,
@@ -1051,44 +955,17 @@ class HermesMemoryProvider:
             import uuid
 
             # Get vector embedding for the text
-            # CRITICAL FIX: Always use the actual table's vector dimension from schema,
-            # not the cached vector_dim which may be stale or wrong due to migration issues.
-            actual_dim = self._storage.vector_dim if self._storage else 384
-            try:
-                # Verify against actual table schema for extra safety
-                if self._storage is not None:
-                    table = self._storage._get_table()
-                    schema = table.schema
-                    vector_field = schema.field("vector")
-                    schema_dim = int(vector_field.type.list_size)
-                    if schema_dim != actual_dim:
-                        logger.warning(
-                            "Vector dimension mismatch detected: storage=%d, schema=%d. "
-                            "Using schema dimension.", actual_dim, schema_dim
-                        )
-                        actual_dim = schema_dim
-                        self._storage.vector_dim = schema_dim  # Fix the cached value
-            except Exception:
-                pass  # Fallback to cached value
-
-            vector_dim = actual_dim
+            # Use embedder directly (not via retriever which doesn't have embed())
+            vector_dim = self._storage.vector_dim if self._storage else 384
             try:
                 if self._embedder:
                     vector = self._embedder.embed(text)
-                    # Verify embedder output matches expected dimension
-                    if len(vector) != vector_dim:
-                        logger.warning(
-                            "Embedder output dimension mismatch: expected %d, got %d. "
-                            "Padding/truncating.", vector_dim, len(vector)
-                        )
-                        if len(vector) < vector_dim:
-                            vector = vector + [0.0] * (vector_dim - len(vector))
-                        else:
-                            vector = vector[:vector_dim]
                 else:
                     # Fallback: generate a deterministic pseudo-embedding from text hash
+                    # Match the table's vector dimension, not hardcoded 384
                     import hashlib
                     h = hashlib.sha256(text.encode()).digest()
+                    # Extend hash to required dimension using repeated hashing
                     vector = []
                     seed = text
                     while len(vector) < vector_dim:
@@ -1138,13 +1015,13 @@ class HermesMemoryProvider:
                 pass
 
             if duplicate_id:
-                # Update existing entry: boost importance and refresh updated_at
+                # Update existing entry: boost importance and refresh timestamp
                 try:
                     self._storage.update(
                         duplicate_id,
                         {
                             "importance": min(1.0, importance + 0.1),
-                            "updated_at": int(time.time() * 1e9),  # ns timestamp for LanceDB schema
+                            "timestamp": time.time(),
                         },
                     )
                     return {
@@ -1176,13 +1053,11 @@ class HermesMemoryProvider:
 
             # CRITICAL: Flush buffer immediately to ensure data is persisted
             # LanceDB uses async buffering - without this flush, data may be lost
-            flush_success = False
             if self._storage and hasattr(self._storage, '_flush_buffer'):
                 try:
                     self._storage._flush_buffer()
-                    flush_success = True
                 except Exception as e:
-                    logger.error("CRITICAL: Failed to flush storage buffer: %s", e, exc_info=True)
+                    logger.debug("Failed to flush storage buffer: %s", e)
 
             # Add to Working Memory (best-effort)
             if self._working_memory is not None:
@@ -1224,7 +1099,6 @@ class HermesMemoryProvider:
                 "category": stored.category,
                 "scope": stored.scope,
                 "importance": stored.importance,
-                "flush_success": flush_success,
             }
 
     def recall(self, memory_id: str) -> Optional[Dict[str, Any]]:
@@ -1278,39 +1152,22 @@ class HermesMemoryProvider:
             return profile
 
         try:
-            # Search KG for user facts - use broader query to catch more results
-            triples = self._kg.search("")  # Empty query returns all
+            # Search KG for user facts
+            triples = self._kg.search("user preferences")
             
-            for triple in triples[:50]:
-                # Look for user-related triples
-                if any(kw in triple.subject.lower() or kw in triple.object.lower() 
-                       for kw in ["user", "城哥", "preference", "prefers", "likes", "决策", "风格"]):
-                    if triple.predicate in ["prefers", "likes", "owns", "决策模式", "风格"]:
-                        profile["preferences"].append({
-                            "subject": triple.subject,
-                            "predicate": triple.predicate,
-                            "object": triple.object,
-                        })
-                    else:
-                        profile["facts"].append({
-                            "subject": triple.subject,
-                            "predicate": triple.predicate,
-                            "object": triple.object,
-                        })
-                        
-            # Also add recent high-importance memories as "recent"
-            if self._storage:
-                try:
-                    recent = self._storage.bm25_search("", limit=5)
-                    for r in recent:
-                        profile["recent"].append({
-                            "text": r.entry.text[:200],
-                            "category": r.entry.category,
-                            "timestamp": r.entry.timestamp,
-                        })
-                except Exception:
-                    pass
-                    
+            for triple in triples[:20]:
+                if triple.predicate in ["prefers", "likes", "owns"]:
+                    profile["preferences"].append({
+                        "subject": triple.subject,
+                        "predicate": triple.predicate,
+                        "object": triple.object,
+                    })
+                else:
+                    profile["facts"].append({
+                        "subject": triple.subject,
+                        "predicate": triple.predicate,
+                        "object": triple.object,
+                    })
         except Exception as e:
             logger.debug("get_profile KG search failed: %s", e)
 

@@ -43,6 +43,7 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
     safe_url_for_log,
     cache_document_from_bytes,
+    DEFAULT_HTTPX_LIMITS,
 )
 
 
@@ -729,6 +730,7 @@ class SlackAdapter(BasePlatformAdapter):
                 timeout=30.0,
                 follow_redirects=True,
                 event_hooks={"response": [_ssrf_redirect_guard]},
+                limits=DEFAULT_HTTPX_LIMITS,
             ) as client:
                 response = await client.get(image_url)
                 response.raise_for_status()
@@ -1654,7 +1656,7 @@ class SlackAdapter(BasePlatformAdapter):
 
         bot_token = self._team_clients[team_id].token if team_id and team_id in self._team_clients else self.config.token
 
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, limits=DEFAULT_HTTPX_LIMITS) as client:
             for attempt in range(3):
                 try:
                     response = await client.get(
@@ -1697,7 +1699,7 @@ class SlackAdapter(BasePlatformAdapter):
 
         bot_token = self._team_clients[team_id].token if team_id and team_id in self._team_clients else self.config.token
 
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, limits=DEFAULT_HTTPX_LIMITS) as client:
             for attempt in range(3):
                 try:
                     response = await client.get(

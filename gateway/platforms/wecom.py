@@ -66,6 +66,7 @@ from gateway.platforms.base import (
     SendResult,
     cache_document_from_bytes,
     cache_image_from_bytes,
+    DEFAULT_HTTPX_LIMITS,
 )
 
 logger = logging.getLogger(__name__)
@@ -206,7 +207,7 @@ class WeComAdapter(BasePlatformAdapter):
             return False
 
         try:
-            self._http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+            self._http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True, limits=DEFAULT_HTTPX_LIMITS)
             await self._open_connection()
             self._mark_connected()
             self._listen_task = asyncio.create_task(self._listen_loop())
@@ -1043,7 +1044,7 @@ class WeComAdapter(BasePlatformAdapter):
         if not HTTPX_AVAILABLE:
             raise RuntimeError("httpx is required for WeCom media download")
 
-        client = self._http_client or httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+        client = self._http_client or httpx.AsyncClient(timeout=30.0, follow_redirects=True, limits=DEFAULT_HTTPX_LIMITS)
         created_client = client is not self._http_client
         try:
             async with client.stream(

@@ -1512,7 +1512,7 @@ def _to_async_client(sync_client, model: str):
 
         async_kwargs["default_headers"] = copilot_default_headers()
     elif base_url_host_matches(sync_base_url, "api.kimi.com"):
-        async_kwargs["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
+        async_kwargs["default_headers"] = {"User-Agent": "KimiCLI/1.30.0"}
     return AsyncOpenAI(**async_kwargs), model
 
 
@@ -1699,7 +1699,7 @@ def resolve_provider_client(
             )
             extra = {}
             if base_url_host_matches(custom_base, "api.kimi.com"):
-                extra["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
+                extra["default_headers"] = {"User-Agent": "KimiCLI/1.30.0"}
             elif base_url_host_matches(custom_base, "api.githubcopilot.com"):
                 from hermes_cli.models import copilot_default_headers
                 extra["default_headers"] = copilot_default_headers()
@@ -1806,7 +1806,7 @@ def resolve_provider_client(
         # Provider-specific headers
         headers = {}
         if base_url_host_matches(base_url, "api.kimi.com"):
-            headers["User-Agent"] = "claude-code/0.1.0"
+            headers["User-Agent"] = "KimiCLI/1.30.0"
         elif base_url_host_matches(base_url, "api.githubcopilot.com"):
             from hermes_cli.models import copilot_default_headers
 
@@ -2618,14 +2618,13 @@ def _build_call_kwargs(
 
     # MiniMax-M2.7-highspeed only accepts temperature=0.6 — silently clamp
     # any other value to avoid "invalid temperature" 400 errors.
-    # Also include kimi-coding-cn and kimi-coding since they route to MiniMax API.
-    _minimax_cn = provider in ("minimax", "minimax-cn", "kimi-coding", "kimi-coding-cn")
+    _minimax_cn = provider in ("minimax", "minimax-cn")
     # When provider="auto" the clamp above misses MiniMax because "auto" is not in the list.
     # Fall back to model-name detection so any caller that uses provider="auto" with a
     # MiniMax model still gets protected.
     if not _minimax_cn and temperature is not None and temperature != 0.6:
         _m = (model or "").lower()
-        if _m in ("minimax-m2.7-highspeed", "kimi-for-coding"):
+        if _m == "minimax-m2.7-highspeed":
             _minimax_cn = True
     # Also check base_url for MiniMax endpoints (handles provider="auto" case where
     # the actual endpoint URL contains "minimax" or "api.minimax").

@@ -78,13 +78,6 @@ from tools.browser_tool import cleanup_browser
 
 # Agent internals extracted to agent/ package for modularity
 from agent.memory_manager import build_memory_context_block, sanitize_context
-from agent.cognitive_state import (
-    load_cognitive_state, save_cognitive_state, create_default_state,
-    update_focus, add_correction, add_decision, set_stage, increment_turn,
-    check_output_violations, build_correction_prompt,
-    generate_predictive_queries, detect_corrections_from_turn,
-    format_state_for_system_prompt,
-)
 from agent.retry_utils import jittered_backoff
 from agent.error_classifier import classify_api_error, FailoverReason
 from agent.prompt_builder import (
@@ -1084,20 +1077,6 @@ class AIAgent:
         # same image history.
         self._anthropic_image_fallback_cache: Dict[str, str] = {}
 
-        # =====================================================================
-        # Cognitive State — deterministic continuity layer
-        # =====================================================================
-        # Unlike probabilistic memory retrieval, cognitive state is always
-        # loaded and directly drives pre-output guardrails.
-        self._cognitive_state: Dict[str, Any] = {}
-        self._cognitive_state_loaded: bool = False
-        self._cognitive_state_dirty: bool = False
-        # Pre-output guardrail: max retries when violation detected
-        self._guardrail_max_retries: int = 2
-        self._guardrail_retry_count: int = 0
-        # Predictive search queries from cognitive state
-        self._predictive_queries: List[str] = []
-
         # Initialize LLM client via centralized provider router.
         # The router handles auth resolution, base URL, headers, and
         # Codex/Anthropic wrapping for all known providers.
@@ -1943,11 +1922,7 @@ class AIAgent:
         old_provider = self.provider
 
         # ── Swap core runtime fields ──
-        try:
-            from hermes_cli.model_normalize import normalize_model_for_provider
-            self.model = normalize_model_for_provider(new_model, new_provider)
-        except Exception:
-            self.model = new_model
+        self.model = new_model
         self.provider = new_provider
         self.base_url = base_url or self.base_url
         self.api_mode = api_mode
@@ -4220,20 +4195,7 @@ class AIAgent:
         # Active task: inject current focus so the model never loses track
         # of what the user asked for, even after heavy context compression.
         if self._active_task:
-            prompt_parts.append(f"\u5f53\u524d\u4efb\u52a1: {self._active_task}")
-        
-        # =====================================================================
-        # COGNITIVE STATE — inject deterministic context into system prompt
-        # =====================================================================
-        # This is NOT memory retrieval (which is probabilistic). Cognitive state
-        # is always loaded, always injected, and always up-to-date. It ensures
-        # the model knows: current focus, recent corrections, error immunity,
-        # active project, and conversation stage — even after agent restart.
-        if self._cognitive_state:
-            _cog_text = format_state_for_system_prompt(self._cognitive_state)
-            if _cog_text:
-                prompt_parts.append(_cog_text)
-        # =====================================================================
+            prompt_parts.append(f"当前任务: {self._active_task}")
         
         # Alibaba Coding Plan API always returns "glm-4.7" as model name regardless
         # of the requested model. Inject explicit model identity into the system prompt
@@ -8755,43 +8717,6 @@ class AIAgent:
             self._active_task = _clean_task
             self._invalidate_system_prompt()
         
-        # =====================================================================
-        # COGNITIVE STATE — Pre-dialogue hydration
-        # =====================================================================
-        # Load deterministic cognitive state that survives agent instance
-        # destruction (gateway cache eviction, etc.). This is NOT probabilistic
-        # memory retrieval — it always loads, always injects, always works.
-        if not self._cognitive_state_loaded:
-            self._cognitive_state = load_cognitive_state(self.session_id or "default")
-            if not self._cognitive_state:
-                self._cognitive_state = create_default_state()
-            self._cognitive_state_loaded = True
-            logger.info("Cognitive state loaded for session %s: focus=%r stage=%r",
-                        self.session_id,
-                        self._cognitive_state.get("current_focus", ""),
-                        self._cognitive_state.get("conversation_stage", ""))
-        
-        # Update focus from current message
-        if _clean_task:
-            self._cognitive_state = update_focus(self._cognitive_state, _clean_task)
-            self._cognitive_state_dirty = True
-        
-        # Increment turn counter
-        self._cognitive_state = increment_turn(self._cognitive_state)
-        self._cognitive_state_dirty = True
-        
-        # Reset guardrail retry counter for new turn
-        self._guardrail_retry_count = 0
-        
-        # Generate predictive search queries for memory prefetch
-        self._predictive_queries = generate_predictive_queries(
-            _raw_task, self._cognitive_state
-        )
-        if self._predictive_queries:
-            logger.info("Predictive queries: %s", self._predictive_queries)
-        
-        # =====================================================================
-        
         # Reset retry counters and iteration budget at the start of each turn
         # so subagent usage from a previous turn doesn't eat into the next one.
         self._invalid_tool_retries = 0
@@ -9082,38 +9007,13 @@ class AIAgent:
         # prefetch_all() on each tool call (10 tool calls = 10x latency + cost).
         # Use original_user_message (clean input) — user_message may contain
         # injected skill content that bloats / breaks provider queries.
-        #
-        # COGNITIVE STATE: Also search with predictive queries generated from
-        # the cognitive state (current focus, project, recent corrections).
-        # This ensures we recall relevant context even when the user's message
-        # doesn't contain explicit keywords.
         _ext_prefetch_cache = ""
         _intent_confirmation_message = ""
         _intent_confirmation_needed = False
         if self._memory_manager:
             try:
                 _query = original_user_message if isinstance(original_user_message, str) else ""
-                # Primary query: user's message
-                _all_results = self._memory_manager.prefetch_all(_query) or ""
-                
-                # Predictive queries from cognitive state
-                for _pq in self._predictive_queries:
-                    if _pq and _pq != _query:
-                        _pq_result = self._memory_manager.prefetch_all(_pq) or ""
-                        if _pq_result:
-                            _all_results += "\n\n" + _pq_result
-                
-                # Deduplicate by hashing lines (simple dedup)
-                if _all_results:
-                    seen = set()
-                    unique_lines = []
-                    for line in _all_results.split("\n"):
-                        line_hash = hash(line.strip())
-                        if line_hash not in seen and line.strip():
-                            seen.add(line_hash)
-                            unique_lines.append(line)
-                    _ext_prefetch_cache = "\n".join(unique_lines)
-                
+                _ext_prefetch_cache = self._memory_manager.prefetch_all(_query) or ""
                 # INTENT GATE (2026-05-01): Check if memory provider returned
                 # a confirmation request instead of memory results
                 if "[INTENT_CONFIRMATION_NEEDED]" in _ext_prefetch_cache:
@@ -12051,83 +11951,6 @@ class AIAgent:
             )
         except Exception as exc:
             logger.warning("on_session_end hook failed: %s", exc)
-
-        # =====================================================================
-        # COGNITIVE STATE — Pre-output guardrail + Post-dialogue evolution
-        # =====================================================================
-        # 1. Pre-output guardrail: check if final_response violates error immunity
-        #    If violated, regenerate with correction prompt (up to max retries)
-        if final_response and self._cognitive_state:
-            _violations = check_output_violations(
-                final_response,
-                self._cognitive_state.get("error_immunity", [])
-            )
-            if _violations and self._guardrail_retry_count < self._guardrail_max_retries:
-                self._guardrail_retry_count += 1
-                logger.warning(
-                    "Guardrail triggered: %d violation(s) detected, retry %d/%d",
-                    len(_violations), self._guardrail_retry_count, self._guardrail_max_retries
-                )
-                _correction_prompt = build_correction_prompt(_violations, final_response)
-                # Inject correction as a user message and force one more iteration
-                messages.append({"role": "user", "content": _correction_prompt})
-                # Force one more API call
-                self._budget_grace_call = True
-                # Re-enter the loop for one more iteration
-                # Note: this is a simplified approach — the loop has already exited,
-                # so we do a single correction call here
-                try:
-                    _corr_messages = [{"role": "system", "content": active_system_prompt or ""}] + messages
-                    _corr_response = self.client.chat.completions.create(
-                        model=self.model,
-                        messages=_corr_messages,
-                        tools=self.tools,
-                    )
-                    if _corr_response.choices:
-                        final_response = _corr_response.choices[0].message.content or ""
-                        result["final_response"] = final_response
-                except Exception as e:
-                    logger.error("Guardrail correction call failed: %s", e)
-        
-        # 2. Post-dialogue: detect corrections, update cognitive state, save
-        if self._cognitive_state:
-            # Detect corrections from the turn
-            _new_corrections = detect_corrections_from_turn(messages)
-            for corr in _new_corrections:
-                self._cognitive_state = add_correction(
-                    self._cognitive_state,
-                    corr["error_type"],
-                    corr["description"],
-                    corr["trigger_pattern"],
-                    corr["correct_action"],
-                    corr.get("importance", 0.9)
-                )
-                self._cognitive_state_dirty = True
-                logger.info("Detected correction: %s", corr["description"][:80])
-            
-            # Update conversation stage based on turn outcome
-            if interrupted:
-                self._cognitive_state = set_stage(self._cognitive_state, "error")
-            elif api_call_count >= self.max_iterations:
-                self._cognitive_state = set_stage(self._cognitive_state, "error")
-            elif completed:
-                self._cognitive_state = set_stage(self._cognitive_state, "done")
-            else:
-                self._cognitive_state = set_stage(self._cognitive_state, "execute")
-            self._cognitive_state_dirty = True
-            
-            # Save cognitive state if dirty
-            if self._cognitive_state_dirty:
-                try:
-                    save_cognitive_state(
-                        self.session_id or "default",
-                        self._cognitive_state
-                    )
-                    self._cognitive_state_dirty = False
-                    logger.info("Cognitive state saved for session %s", self.session_id)
-                except Exception as e:
-                    logger.error("Failed to save cognitive state: %s", e)
-        # =====================================================================
 
         return result
 

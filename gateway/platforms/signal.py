@@ -36,6 +36,7 @@ from gateway.platforms.base import (
     cache_audio_from_bytes,
     cache_document_from_bytes,
     cache_image_from_url,
+    DEFAULT_HTTPX_LIMITS,
 )
 from gateway.platforms.helpers import redact_phone
 
@@ -231,7 +232,7 @@ class SignalAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("Signal: Could not acquire phone lock (non-fatal): %s", e)
 
-        self.client = httpx.AsyncClient(timeout=30.0)
+        self.client = httpx.AsyncClient(timeout=30.0, limits=DEFAULT_HTTPX_LIMITS)
         try:
             # Health check — verify signal-cli daemon is reachable
             try:

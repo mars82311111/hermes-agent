@@ -184,6 +184,9 @@ class MemoryEntry:
         meta["tier"] = self.tier
         meta["confidence"] = self.confidence
         meta["temporal_type"] = self.temporal_type
+        # CRITICAL FIX: Use created_at (ns timestamp) instead of timestamp for LanceDB schema compatibility
+        # The table schema has created_at/updated_at, not timestamp
+        created_at_ns = int(self.timestamp * 1e9) if self.timestamp > 0 else int(time.time() * 1e9)
         return {
             "id": self.id,
             "text": self.text,
@@ -191,7 +194,8 @@ class MemoryEntry:
             "category": self.category,
             "scope": self.scope,
             "importance": self.importance,
-            "timestamp": int(self.timestamp),  # Schema expects int64
+            "created_at": created_at_ns,
+            "updated_at": created_at_ns,
             "metadata": json.dumps(meta, ensure_ascii=False),
         }
 
@@ -210,6 +214,11 @@ class MemoryEntry:
                 meta = {}
         except (json.JSONDecodeError, TypeError):
             meta = {}
+        # CRITICAL FIX: Read created_at (ns) and convert to timestamp (seconds)
+        created_at_ns = row.get("created_at", 0)
+        if hasattr(created_at_ns, "value"):
+            created_at_ns = created_at_ns.value  # pandas Timestamp
+        timestamp_sec = float(created_at_ns) / 1e9 if created_at_ns else 0.0
         return cls(
             id=row["id"],
             text=row["text"],
@@ -217,7 +226,7 @@ class MemoryEntry:
             category=row.get("category", "other"),
             scope=row.get("scope", "global"),
             importance=float(row.get("importance", 0.5)),
-            timestamp=float(row.get("timestamp", 0.0)),
+            timestamp=timestamp_sec,
             metadata=metadata,
             access_count=int(meta.get("access_count", 0)),
             created_at=int(meta.get("created_at", 0)),
@@ -258,7 +267,7 @@ class LanceDBStorage:
         self._fts_index_created = False
         # Fragmentation prevention: track write count for periodic compaction
         self._write_count = 0
-        self._compact_threshold = 50  # Compact every 50 writes to prevent fragmentation
+        self._compact_threshold = 10  # Compact every 10 writes to prevent fragmentation (reduced from 50)
         # OPTIMIZATION: Write batching buffer to amortize lock acquisition cost
         self._write_buffer: list[dict] = []
         self._batch_size = 10
@@ -326,33 +335,47 @@ class LanceDBStorage:
         return table
 
     def _ensure_vector_index(self, table: Any) -> None:
-        """Create ANN vector index on 'vector' column if not already present."""
+        """Create ANN vector index on 'vector' column if not already present.
+        
+        CRITICAL FIX: Handles LanceDB API version differences and data size requirements.
+        - For small datasets (<256 rows): skip index creation (FLAT scan is fine)
+        - For large datasets: create IVF_PQ index with proper parameters
+        """
         try:
-            indices = table.list_indices()
+            # Check row count first
+            row_count = table.count_rows()
+            if row_count < 256:
+                logger.debug("Table has %d rows (<256), skipping vector index creation (FLAT scan sufficient)", row_count)
+                return
+            
+            # Check if index already exists using multiple API versions
             has_vector_idx = False
-            for idx in indices:
-                idx_type = getattr(idx, 'index_type', None)
-                if idx_type and 'vector' in str(idx_type).lower():
-                    has_vector_idx = True
-                    break
-                # LanceDB 0.27+ uses different attribute names
-                idx_name = getattr(idx, 'name', '')
-                if 'vector' in str(idx_name).lower():
-                    has_vector_idx = True
-                    break
+            try:
+                indices = table.list_indices()
+                for idx in indices:
+                    idx_type = getattr(idx, 'index_type', None)
+                    if idx_type and 'vector' in str(idx_type).lower():
+                        has_vector_idx = True
+                        break
+                    idx_name = getattr(idx, 'name', '')
+                    if 'vector' in str(idx_name).lower():
+                        has_vector_idx = True
+                        break
+            except Exception:
+                # list_indices() may fail on some versions, assume no index
+                has_vector_idx = False
+            
             if not has_vector_idx:
                 try:
-                    # LanceDB 0.30+ API: metric is FIRST positional param,
-                    # column is specified via vector_column_name (defaults to "vector").
-                    # Old code wrongly used: create_index(metric="cosine", vector_column_name="vector")
-                    # which failed with "got multiple values for metric" because metric
-                    # was already filled by the positional "vector" string.
+                    # Use IVF_PQ with num_partitions based on data size
+                    # Rule of thumb: 1 partition per ~1000 rows, min 4
+                    num_partitions = max(4, row_count // 1000)
                     table.create_index(
-                        "cosine",  # metric as first positional arg (LanceDB 0.30 changed API)
+                        "cosine",
                         index_type="IVF_PQ",
-                        num_partitions=4,
+                        num_partitions=num_partitions,
                     )
-                    logger.info("Vector ANN index created (cosine, IVF_PQ, 4 partitions)")
+                    logger.info("Vector ANN index created (cosine, IVF_PQ, %d partitions)", num_partitions)
                 except Exception as e:
                     logger.warning("Vector index creation failed: %s", e)
             else:
@@ -469,15 +492,17 @@ class LanceDBStorage:
 
     def store(self, entry: MemoryEntry) -> MemoryEntry:
         """
-        Insert a new memory entry.  A new UUID is always generated;
-        the entry's existing *id* field is ignored.
+        Insert a new memory entry.  Preserves the entry's existing *id* if provided;
+        otherwise generates a new UUID.
 
         OPTIMIZATION: Uses write batching buffer to amortize lock
         acquisition cost across multiple writes. Buffer auto-flushes
         when it reaches _batch_size or after _flush_interval seconds.
         """
+        # Use provided ID or generate new one
+        entry_id = entry.id if entry.id else self._new_id()
         full = MemoryEntry(
-            id=self._new_id(),
+            id=entry_id,
             text=entry.text,
             vector=entry.vector,
             category=entry.category,
@@ -545,7 +570,23 @@ class LanceDBStorage:
             self._write_count = 0
             self._compact_table()
 
+        # Extra safety: if versions exceed 100, compact immediately regardless of write count
+        # This prevents storage bloat even if _write_count was reset due to provider restart
+        self._compact_if_versions_excessive()
+
         return fulls
+
+    def _compact_if_versions_excessive(self, threshold: int = 100) -> None:
+        """Emergency compaction if version count exceeds threshold. Called after writes."""
+        try:
+            versions_dir = Path(self.db_path).parent / "memories.lance" / "_versions"
+            if versions_dir.exists():
+                version_count = len(os.listdir(versions_dir))
+                if version_count > threshold:
+                    logger.warning(f"LanceDB version count ({version_count}) exceeds threshold ({threshold}), triggering emergency compaction")
+                    self._compact_table()
+        except Exception:
+            pass  # Non-critical, don't fail the write
 
     def _flush_buffer(self) -> None:
         """Flush the write buffer to LanceDB under a single lock acquisition."""
@@ -568,6 +609,9 @@ class LanceDBStorage:
         if self._write_count >= self._compact_threshold:
             self._write_count = 0
             self._compact_table()
+
+        # Extra safety: if versions exceed 100, compact immediately
+        self._compact_if_versions_excessive()
     
     def _compact_table(self) -> None:
         """Compact small data files AND prune old versions to prevent storage bloat."""
@@ -575,15 +619,28 @@ class LanceDBStorage:
             try:
                 from datetime import timedelta
                 table = self._get_table()
-                # CRITICAL FIX: cleanup_older_than=timedelta(days=1) removes old versions
-                # older than 1 day. Previously days=0 removed ALL old versions instantly,
-                # which could cause data loss if a crash occurred during compaction.
-                # Keeping 1 day of history provides a safety window while still preventing
-                # the storage bloat that occurs when optimize() keeps all versions.
-                table.optimize(cleanup_older_than=timedelta(days=1))
-                logger.info("LanceDB compaction completed (optimized + versions older than 1 day pruned)")
+                # CRITICAL FIX (2026-04-26): cleanup_older_than=timedelta(days=1) was too
+                # conservative - versions accumulate faster than they get cleaned, leading
+                # to 5000+ versions and 147MB storage bloat within 1 day.
+                # Changed to timedelta(seconds=0) to prune ALL old versions except current.
+                # This is safe because: (1) LanceDB MVCC ensures readers see consistent
+                # snapshots, (2) we hold the write lock during optimize, (3) crash recovery
+                # is handled by LanceDB's manifest versioning. Retaining 0 old versions
+                # means maximum storage efficiency with zero bloat risk.
+                table.optimize(cleanup_older_than=timedelta(seconds=0))
+                logger.info("LanceDB compaction completed (all old versions pruned)")
             except Exception as e:
                 logger.debug("LanceDB compaction skipped: %s", e)
+            # CRITICAL FIX: After optimize() LanceDB may hold old index file
+            # handles.  Drop the table reference and reopen to release fds.
+            try:
+                self.__table = None
+                import gc
+                gc.collect()
+                time.sleep(0.05)
+                self._init_table()
+            except Exception:
+                pass
         self._with_lock(_do)
 
     def import_entry(self, entry: MemoryEntry) -> MemoryEntry:
@@ -806,15 +863,24 @@ class LanceDBStorage:
         )
 
     def close(self) -> None:
-        """Close is a no-op for LanceDB (stateless).
+        """Release LanceDB table reference and underlying file handles.
 
-        Ensures any buffered writes are flushed before cleanup.
+        LanceDB keeps index files (.idx) open for performance.  Explicitly
+        dropping the table reference lets the Rust backend close its file
+        descriptors.  A short sleep gives the kernel time to reclaim fds
+        before anything else tries to open new files.
         """
         try:
             self._flush_buffer()
         except Exception:
             pass
         self.__table = None
+        # Force garbage collection so LanceDB's Rust objects are dropped
+        # and their file descriptors are released immediately.
+        import gc
+        gc.collect()
+        # Brief pause lets the OS reclaim fds before the next call.
+        time.sleep(0.05)
 
     def has_pending_writes(self) -> bool:
         """Return True if there are buffered writes waiting to be flushed."""

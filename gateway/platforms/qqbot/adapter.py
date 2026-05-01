@@ -69,6 +69,7 @@ from gateway.platforms.base import (
     _ssrf_redirect_guard,
     cache_document_from_bytes,
     cache_image_from_bytes,
+    DEFAULT_HTTPX_LIMITS,
 )
 from gateway.platforms.helpers import strip_markdown
 
@@ -247,6 +248,7 @@ class QQAdapter(BasePlatformAdapter):
                 timeout=30.0,
                 follow_redirects=True,
                 event_hooks={"response": [_ssrf_redirect_guard]},
+                limits=DEFAULT_HTTPX_LIMITS,
             )
 
             # 1. Get access token

@@ -122,9 +122,28 @@ def _resolve_model_override(model_obj: Optional[Dict[str, Any]]) -> tuple:
     If provider is omitted, pins the current main provider from config so the
     job doesn't drift when the user later changes their default via hermes model.
 
+    If model_obj is None, falls back to config.cron.default_model so new cronjobs
+    automatically use the user's preferred default without explicit specification.
+
     Returns (provider_str_or_none, model_str_or_none).
     """
-    if not model_obj or not isinstance(model_obj, dict):
+    if model_obj is None:
+        # Auto-fallback to cron.default_model from config
+        try:
+            from hermes_cli.config import load_config
+            cfg = load_config()
+            cron_cfg = cfg.get("cron", {})
+            if isinstance(cron_cfg, dict):
+                default_model_cfg = cron_cfg.get("default_model")
+                if isinstance(default_model_cfg, dict):
+                    provider_name = (default_model_cfg.get("provider") or "").strip() or None
+                    model_name = (default_model_cfg.get("model") or "").strip() or None
+                    if model_name:
+                        return (provider_name, model_name)
+        except Exception:
+            pass  # Best-effort; fall through to return (None, None)
+        return (None, None)
+    if not isinstance(model_obj, dict):
         return (None, None)
     model_name = (model_obj.get("model") or "").strip() or None
     provider_name = (model_obj.get("provider") or "").strip() or None

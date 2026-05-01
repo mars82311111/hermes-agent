@@ -38,11 +38,13 @@ logger = logging.getLogger(__name__)
 _MINIMAX_API_KEY: Optional[str] = None
 _MINIMAX_BASE_URL: str = "https://api.minimaxi.com/v1"
 _MINIMAX_MODEL: str = "MiniMax-M2.7-highspeed"
+_MINIMAX_MODEL_FALLBACK: str = "MiniMax-M2.7"  # Non-thinking model for reliable extraction
 
 # Extraction settings
 _EXTRACTION_ENABLED: bool = True
 _EXTRACTION_THRESHOLD: float = 0.3  # Skip extraction for texts shorter than this
-_EXTRACTION_TIMEOUT: int = 30  # seconds
+_EXTRACTION_TIMEOUT: int = 180  # seconds
+_EXTRACTION_MAX_RETRIES: int = 2  # Retry with fallback model on failure
 
 # Regex fallback patterns (used if LLM extraction fails)
 _FALLBACK_PATTERNS: List[tuple] = [
@@ -238,28 +240,37 @@ def extract_with_llm(text: str, timeout: int = _EXTRACTION_TIMEOUT) -> Optional[
 {{"entities":[{{"name":"城哥","type":"person"}}],"triples":[{{"subject":"城哥","predicate":"developing","object":"小说写作项目","confidence":0.9}}]}}
 """
 
-    payload = {
-        "model": _MINIMAX_MODEL,
-        "messages": [
-            {"role": "user", "content": prompt}
-        ],
-        "max_tokens": 500,
-        "temperature": 0.1,  # Low temperature for extraction
-    }
+    # Try primary model first, then fallback model on failure
+    models_to_try = [_MINIMAX_MODEL]
+    if _MINIMAX_MODEL_FALLBACK:
+        models_to_try.append(_MINIMAX_MODEL_FALLBACK)
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+    for attempt_model in models_to_try:
+        payload = {
+            "model": attempt_model,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ],
+            "max_tokens": 2000,
+            "temperature": 0.1,
+        }
 
-    url = f"{_MINIMAX_BASE_URL}/chat/completions"
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers=headers)
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
 
-    try:
-        resp = urllib.request.urlopen(req, timeout=timeout)
-        result = json.loads(resp.read().decode("utf-8"))
-        content = result["choices"][0]["message"]["content"]
+        url = f"{_MINIMAX_BASE_URL}/chat/completions"
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers=headers)
+
+        try:
+            resp = urllib.request.urlopen(req, timeout=timeout)
+            result = json.loads(resp.read().decode("utf-8"))
+            content = result["choices"][0]["message"]["content"]
+        except Exception as e:
+            logger.warning("LLM extraction failed (model=%s): %s: %s", attempt_model, type(e).__name__, str(e)[:100])
+            continue  # Try next model
 
         # Parse JSON from response
         content = content.strip()
@@ -275,28 +286,48 @@ def extract_with_llm(text: str, timeout: int = _EXTRACTION_TIMEOUT) -> Optional[
         parse_error = None
 
         # Strategy 1: JSON code block: ```json ... ```
-        json_match = re.search(r'```json\s*(.*?)\s*```', content, re.DOTALL)
+        json_match = re.search(r'```(?:json)?\s*(.*?)\s*```', content, re.DOTALL)
         if json_match:
             json_str = json_match.group(1).strip()
 
-        # Strategy 2: Plain JSON — find first `{` and try to parse
-        # Only use this if strategy 1 didn't work
+        # Strategy 2: Find JSON between first { and matching }
         if not json_str:
             first_brace = content.find('{')
             if first_brace != -1:
-                # Try progressively larger slices to find valid JSON
-                for end_offset in range(50, len(content) - first_brace + 1):
-                    candidate = content[first_brace:first_brace + end_offset]
+                # Use bracket matching to find the matching closing brace
+                brace_count = 0
+                last_brace = -1
+                for i in range(first_brace, len(content)):
+                    if content[i] == '{':
+                        brace_count += 1
+                    elif content[i] == '}':
+                        brace_count -= 1
+                        if brace_count == 0:
+                            last_brace = i
+                            break
+                
+                if last_brace > first_brace:
+                    candidate = content[first_brace:last_brace + 1]
                     try:
                         parsed = json.loads(candidate)
-                        # Check if it has expected structure
                         if isinstance(parsed, dict) and ("entities" in parsed or "triples" in parsed):
                             json_str = candidate
-                            break
                     except json.JSONDecodeError:
-                        continue
+                        pass
 
-        # Strategy 3: Fallback — find last `}` and try from first `{`
+        # Strategy 3: Try progressively larger slices from first {
+        if not json_str and first_brace != -1:
+            for end_offset in range(50, len(content) - first_brace + 1):
+                candidate = content[first_brace:first_brace + end_offset]
+                try:
+                    parsed = json.loads(candidate)
+                    if isinstance(parsed, dict) and ("entities" in parsed or "triples" in parsed):
+                        json_str = candidate
+                        break
+                except json.JSONDecodeError:
+                    continue
+
+        # Strategy 4: Fallback — find last `}` and try from first `{`
         if not json_str:
             last_brace = content.rfind('}')
             if first_brace != -1 and last_brace > first_brace:
@@ -356,9 +387,8 @@ def extract_with_llm(text: str, timeout: int = _EXTRACTION_TIMEOUT) -> Optional[
             method="llm",
         )
 
-    except Exception as e:
-        logger.warning("LLM extraction failed: %s: %s", type(e).__name__, str(e)[:100])
-        return None
+    # All models failed
+    return None
 
 
 def extract_with_regex(text: str) -> ExtractionResult:

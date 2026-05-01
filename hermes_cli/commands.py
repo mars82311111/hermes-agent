@@ -104,6 +104,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("config", "Show current configuration", "Configuration",
                cli_only=True),
     CommandDef("model", "Switch model for this session", "Configuration", args_hint="[model] [--provider name] [--global]"),
+    CommandDef("think", "Switch to Kimi kimi-for-coding for deep thinking", "Configuration", aliases=("kimi",)),
     CommandDef("provider", "Show available providers and current provider",
                "Configuration"),
     CommandDef("gquota", "Show Google Gemini Code Assist quota usage", "Info"),

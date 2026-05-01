@@ -78,6 +78,7 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
     utf16_len,
     _prefix_within_utf16_limit,
+    DEFAULT_HTTPX_LIMITS,
 )
 from gateway.platforms.telegram_network import (
     TelegramFallbackTransport,
@@ -1911,7 +1912,7 @@ class TelegramAdapter(BasePlatformAdapter):
             # Fallback: download and upload as file (supports up to 10MB)
             try:
                 import httpx
-                async with httpx.AsyncClient(timeout=30.0) as client:
+                async with httpx.AsyncClient(timeout=30.0, limits=DEFAULT_HTTPX_LIMITS) as client:
                     resp = await client.get(image_url)
                     resp.raise_for_status()
                     image_data = resp.content
