@@ -138,6 +138,8 @@ from gateway.platforms.base import (
     cache_image_from_url,
     cache_audio_from_bytes,
     cache_image_from_bytes,
+    utf16_len,
+    DEFAULT_HTTPX_LIMITS,
 )
 from gateway.status import acquire_scoped_lock, release_scoped_lock
 from hermes_constants import get_hermes_home
@@ -236,6 +238,9 @@ _FEISHU_REACTION_FAILURE = "CrossMark"
 # drain on completion; the cap is a safeguard against unbounded growth from
 # delete-failures, not a capacity plan.
 _FEISHU_PROCESSING_REACTION_CACHE_SIZE = 1024
+
+_FEISHU_SILENT_SUCCESS_CODES = frozenset({230002})  # bot removed from chat → don't alarm
+_FEISHU_ACK_EMOJI = "OK"
 
 # QR onboarding constants
 _ONBOARD_ACCOUNTS_URLS = {
@@ -383,11 +388,16 @@ class FeishuAdapterSettings:
     webhook_path: str
     ws_reconnect_nonce: int = 30
     ws_reconnect_interval: int = 120
-    ws_ping_interval: Optional[int] = None
-    ws_ping_timeout: Optional[int] = None
+    # CRITICAL FIX: Default ping interval was None (no heartbeat), causing
+    # silent WebSocket disconnects during long-running agent tasks.
+    # 20s ping / 10s timeout ensures the server detects stale connections.
+    ws_ping_interval: Optional[int] = 20
+    ws_ping_timeout: Optional[int] = 10
     admins: frozenset[str] = frozenset()
     default_group_policy: str = ""
     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
+    # When set to "card", ALL plain-text messages are wrapped in an interactive card
+    message_mode: str = "text"
     allow_bots: str = "none"  # "none" | "mentions" | "all"
     require_mention: bool = True
 
@@ -1347,11 +1357,22 @@ def check_feishu_requirements() -> bool:
 class FeishuAdapter(BasePlatformAdapter):
     """Feishu/Lark bot adapter."""
 
-    MAX_MESSAGE_LENGTH = 8000
+    # Message length limits by type (Feishu API constraints)
+    MAX_MESSAGE_LENGTH_TEXT = 4096   # text type limit
+    MAX_MESSAGE_LENGTH_POST = 10000  # post type limit
+    MAX_MESSAGE_LENGTH = 10000       # backward compatibility (deprecated, use type-specific limits)
+    
     # Threshold for detecting Feishu client-side message splits.
     # When a chunk is near the ~4096-char practical limit, a continuation
     # is almost certain.
     _SPLIT_THRESHOLD = 4000
+
+    # P2: Configurable message chunk size (env vars override class defaults)
+    _MESSAGE_FILE_THRESHOLD = int(os.getenv("HERMES_FEISHU_FILE_THRESHOLD", "20000"))
+    
+    # P2: Enable streaming output
+    _STREAMING_ENABLED = os.getenv("HERMES_FEISHU_STREAMING", "true").lower() in ("true", "1", "yes")
+    _STREAMING_UPDATE_INTERVAL = float(os.getenv("HERMES_FEISHU_STREAMING_INTERVAL", "1.5"))
 
     # =========================================================================
     # Lifecycle — init / settings / connect / disconnect
@@ -1500,6 +1521,7 @@ class FeishuAdapter(BasePlatformAdapter):
             admins=admins,
             default_group_policy=default_group_policy,
             group_rules=group_rules,
+            message_mode=str(extra.get("message_mode", os.getenv("HERMES_FEISHU_MESSAGE_MODE", "text"))).strip().lower(),
             allow_bots=allow_bots,
             require_mention=_to_boolean(
                 extra.get("require_mention", os.getenv("FEISHU_REQUIRE_MENTION", "true"))
@@ -1534,6 +1556,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_reconnect_interval = settings.ws_reconnect_interval
         self._ws_ping_interval = settings.ws_ping_interval
         self._ws_ping_timeout = settings.ws_ping_timeout
+        self._message_mode = settings.message_mode
         self._allow_bots = settings.allow_bots
         self._require_mention = settings.require_mention
 
@@ -1697,17 +1720,116 @@ class FeishuAdapter(BasePlatformAdapter):
         content: str,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        force_text: bool = False,
     ) -> SendResult:
-        """Send a Feishu message."""
+        """Send a Feishu message.
+        
+        Auto-detects card JSON and sends as interactive card if detected.
+        P0 Fix: Uses UTF-16 length calculation for accurate emoji counting.
+        P0 Fix: Respects message-type-specific length limits (text=4096, post=10000).
+        P2 Fix: Auto-converts extremely long messages to file attachments.
+        
+        Args:
+            force_text: If True, sends as plain text even when message_mode="card".
+                        Used for scroll messages that need to be editable.
+        """
         if not self._client:
             return SendResult(success=False, error="Not connected")
+        
+        # Auto-detect card JSON
+        if content and content.strip().startswith('{'):
+            try:
+                msg_data = json.loads(content)
+                if 'percent' in msg_data or 'steps' in msg_data or 'level' in msg_data or 'buttons' in msg_data:
+                    # This is card data, send as interactive card
+                    import sys
+                    sys.path.insert(0, '/Users/mars/.hermes/skills/feishu-card-designer/scripts')
+                    from feishu_card_builder import build_card
+
+                    if 'percent' in msg_data or 'steps' in msg_data:
+                        card_type = "progress"
+                    elif 'level' in msg_data:
+                        card_type = "notification"
+                    elif 'buttons' in msg_data:
+                        card_type = "approval"
+                    else:
+                        card_type = "status"
+
+                    card = build_card(card_type, msg_data)
+                    return await self.send_card(chat_id, card, reply_to=reply_to, metadata=metadata)
+            except (json.JSONDecodeError, ValueError):
+                pass
 
         formatted = self.format_message(content)
-        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+
+        # Check if there's an active scroll card for this chat_id
+        # If so, accumulate the message in the scroll card instead of sending directly
+        try:
+            import sys as _sys
+            _sys.path.insert(0, '/Users/mars/.hermes/scripts')
+            from feishu_scroll_card import scroll_card_manager
+            
+            # Reload state to get latest cards
+            scroll_card_manager._reload_state()
+            
+            # Check for active scroll card for this chat_id
+            for _cid, _cstate in scroll_card_manager._cards.items():
+                if _cstate.get("chat_id") == chat_id and _cstate.get("status") in ("running", "pending"):
+                    # Found active scroll card - accumulate message instead of sending
+                    _step_name = "📨 回复"
+                    scroll_card_manager.append_step(_cid, _step_name, content)
+                    # Update the card in background thread
+                    _payload = scroll_card_manager.build_update_payload(_cid)
+                    if _payload and _payload.get("message_id"):
+                        import json as _json
+                        _card_json = _json.dumps(_payload["card"], ensure_ascii=False)
+                        from lark_oapi.api.im.v1 import PatchMessageRequest, PatchMessageRequestBody
+                        _request = PatchMessageRequest.builder() \
+                            .message_id(_payload["message_id"]) \
+                            .request_body(PatchMessageRequestBody.builder()
+                                .content(_card_json)
+                                .build()) \
+                            .build()
+                        # Run in thread to not block async send
+                        import threading
+                        def _patch_card():
+                            try:
+                                self._client.im.v1.message.patch(_request)
+                            except Exception:
+                                pass
+                        threading.Thread(target=_patch_card, daemon=True).start()
+                    return SendResult(success=True, message_id=_payload.get("message_id") if _payload else None)
+        except Exception:
+            pass  # Fall through to normal send if scroll card check fails
+
+        # When message_mode=="card", wrap all plain-text messages in an interactive card
+        # Skip card wrapping if force_text=True (for scroll messages that need editing)
+        if self._message_mode == "card" and not force_text:
+            card = {
+                "config": {"wide_screen_mode": True},
+                "header": {
+                    "title": {"content": "消息", "tag": "plain_text"},
+                    "template": "blue"
+                },
+                "elements": [{"tag": "markdown", "content": formatted}]
+            }
+            return await self.send_card(chat_id, card, reply_to=reply_to, metadata=metadata)
+        
+        # P2: Check if message is extremely long and should be sent as file
+        if utf16_len(formatted) > self._MESSAGE_FILE_THRESHOLD:
+            logger.info("[Feishu] Message exceeds %d chars, converting to file", self._MESSAGE_FILE_THRESHOLD)
+            return await self._send_long_message_as_file(chat_id, formatted, reply_to, metadata)
+        
+        # P0 Fix: Determine message type first to use correct length limit
+        is_post = bool(_MARKDOWN_HINT_RE.search(formatted))
+        max_length = self.MAX_MESSAGE_LENGTH_POST if is_post else self.MAX_MESSAGE_LENGTH_TEXT
+        
+        # P0 Fix: Use UTF-16 length calculation for accurate counting (especially for emoji)
+        chunks = self.truncate_message(formatted, max_length, len_fn=utf16_len)
         last_response = None
 
         try:
-            for chunk in chunks:
+            for i, chunk in enumerate(chunks):
                 msg_type, payload = self._build_outbound_payload(chunk)
                 try:
                     response = await self._feishu_send_with_retry(
@@ -1742,6 +1864,20 @@ class FeishuAdapter(BasePlatformAdapter):
                         metadata=metadata,
                     )
                 last_response = response
+
+            # Silently swallow "bot not in chat" — prevents cron ERROR spam when
+            # the bot has been removed from a group.  The user already knows
+            # (they removed it); no need to fill the logs.
+            if (
+                last_response
+                and getattr(last_response, "code", None) in _FEISHU_SILENT_SUCCESS_CODES
+            ):
+                logger.debug(
+                    "[Feishu] Bot not in chat %s (code %s); treating as silent success",
+                    chat_id,
+                    last_response.code,
+                )
+                return SendResult(success=True, raw_response=last_response)
 
             return self._finalize_send_result(last_response, "send failed")
         except Exception as exc:
@@ -1782,6 +1918,139 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("[Feishu] Failed to edit message %s: %s", message_id, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
+
+    # =========================================================================
+    # P1: Streaming message support
+    # =========================================================================
+
+    async def send_streaming(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a message with streaming-like updates.
+        
+        Uses Feishu's message edit API to simulate streaming output.
+        Sends an initial message, then updates it with the full content.
+        If content is too long for a single message, edits to first chunk and
+        sends remaining chunks as follow-up messages.
+        
+        P1 Fix: Provides real-time message updates for long responses.
+        """
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+        
+        if not self._STREAMING_ENABLED:
+            # Fallback to regular send if streaming is disabled
+            return await self.send(chat_id, content, reply_to, metadata)
+        
+        formatted = self.format_message(content)
+        
+        # Determine message type and length limit
+        is_post = bool(_MARKDOWN_HINT_RE.search(formatted))
+        max_length = self.MAX_MESSAGE_LENGTH_POST if is_post else self.MAX_MESSAGE_LENGTH_TEXT
+        
+        # Check if content fits in a single message
+        if utf16_len(formatted) <= max_length:
+            # Short message — just send normally
+            return await self.send(chat_id, content, reply_to, metadata)
+        
+        # Long message — use streaming approach
+        try:
+            # Send initial placeholder
+            placeholder = "⏳ Generating response..."
+            initial_result = await self.send(chat_id, placeholder, reply_to, metadata)
+            if not initial_result.success or not initial_result.message_id:
+                logger.warning("[Feishu] Failed to send streaming placeholder, falling back to regular send")
+                return await self.send(chat_id, content, reply_to, metadata)
+            
+            message_id = initial_result.message_id
+            
+            # Build chunks
+            chunks = self.truncate_message(formatted, max_length, len_fn=utf16_len)
+            
+            # Edit first message with first chunk
+            first_chunk = chunks[0]
+            try:
+                await self.edit_message(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    content=first_chunk,
+                    finalize=False,
+                )
+            except Exception as edit_exc:
+                logger.warning("[Feishu] Streaming initial edit failed: %s", edit_exc)
+                # If edit fails, send all chunks as new messages
+                return await self.send(chat_id, content, reply_to, metadata)
+            
+            # Send remaining chunks as new messages
+            for chunk in chunks[1:]:
+                await asyncio.sleep(self._STREAMING_UPDATE_INTERVAL)
+                await self.send(chat_id, chunk, reply_to=None, metadata=metadata)
+            
+            return SendResult(success=True, message_id=message_id)
+            
+        except Exception as exc:
+            logger.error("[Feishu] Streaming send error: %s", exc, exc_info=True)
+            # Fallback to regular send
+            return await self.send(chat_id, content, reply_to, metadata)
+
+    # =========================================================================
+    # P2: Long message handling (auto-convert to file)
+    # =========================================================================
+
+    async def _send_long_message_as_file(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Convert an extremely long message to a text file and send it.
+        
+        P2 Fix: Prevents message loss when content exceeds practical limits.
+        """
+        import tempfile
+        import time
+        
+        try:
+            # Create a temporary text file
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            filename = f"message_{timestamp}.txt"
+            
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
+                f.write(content)
+                temp_path = f.name
+            
+            try:
+                # Send as file document
+                result = await self.send_document(
+                    chat_id=chat_id,
+                    file_path=temp_path,
+                    caption=f"📄 Message too long ({utf16_len(content)} chars). Sent as file.",
+                    reply_to=reply_to,
+                    metadata=metadata,
+                )
+                return result
+            finally:
+                # Clean up temp file
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+                    
+        except Exception as exc:
+            logger.error("[Feishu] Failed to send long message as file: %s", exc, exc_info=True)
+            # Last resort: truncate and send
+            logger.warning("[Feishu] Falling back to truncated send")
+            is_post = bool(_MARKDOWN_HINT_RE.search(content))
+            max_length = self.MAX_MESSAGE_LENGTH_POST if is_post else self.MAX_MESSAGE_LENGTH_TEXT
+            chunks = self.truncate_message(content[:self._MESSAGE_FILE_THRESHOLD], max_length, len_fn=utf16_len)
+            if chunks:
+                return await self.send(chat_id, chunks[0], reply_to, metadata)
+            return SendResult(success=False, error=f"Failed to send long message: {exc}")
 
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
@@ -1989,6 +2258,76 @@ class FeishuAdapter(BasePlatformAdapter):
             return self._finalize_send_result(message_response, "image send failed")
         except Exception as exc:
             logger.error("[Feishu] Failed to send image %s: %s", image_path, exc, exc_info=True)
+            return SendResult(success=False, error=str(exc))
+
+    async def send_card(
+        self,
+        chat_id: str,
+        card: Dict[str, Any],
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send an interactive card message to Feishu.
+        
+        Args:
+            chat_id: Target chat ID
+            card: Feishu card dict (config/header/elements structure)
+            reply_to: Optional message ID to reply to
+            metadata: Optional metadata dict
+        
+        Returns:
+            SendResult with message_id on success
+        """
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+        
+        try:
+            payload = json.dumps(card, ensure_ascii=False)
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="interactive",
+                payload=payload,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+            return self._finalize_send_result(response, "card send failed")
+        except Exception as exc:
+            logger.error("[Feishu] Failed to send card: %s", exc, exc_info=True)
+            return SendResult(success=False, error=str(exc))
+
+    async def update_card(
+        self,
+        message_id: str,
+        card: Dict[str, Any],
+    ) -> SendResult:
+        """Update a previously sent interactive card.
+        
+        Uses PATCH method (PatchMessageRequest) as required by Feishu API.
+        The card content is passed directly as JSON without msg_type wrapper.
+        
+        Args:
+            message_id: The message_id of the card to update
+            card: New card content dict
+        
+        Returns:
+            SendResult with success status
+        """
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+        
+        try:
+            payload = json.dumps(card, ensure_ascii=False)
+            # Use PatchMessageRequestBody (only needs content, not msg_type)
+            from lark_oapi.api.im.v1 import PatchMessageRequest, PatchMessageRequestBody
+            body = PatchMessageRequestBody.builder().content(payload).build()
+            request = PatchMessageRequest.builder().message_id(message_id).request_body(body).build()
+            response = await asyncio.to_thread(self._client.im.v1.message.patch, request)
+            result = self._finalize_send_result(response, "card update failed")
+            if result.success:
+                result.message_id = message_id
+            return result
+        except Exception as exc:
+            logger.error("[Feishu] Failed to update card %s: %s", message_id, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
@@ -2566,11 +2905,28 @@ class FeishuAdapter(BasePlatformAdapter):
         """Dispatch a single event through the agent pipeline with per-chat serialization
         before handing the event off to the agent.
 
-        Per-chat lock ensures messages in the same chat are processed one at a
-        time (matches openclaw's createChatQueue serial queue behaviour).
+        - Per-chat lock: ensures messages in the same chat are processed one at a time
+          (matches openclaw's createChatQueue serial queue behaviour).
+        - ACK indicator: adds a CHECK reaction to the triggering message before handing
+          off to the agent and leaves it in place as a receipt marker.
+        - Queue feedback: if another message is already being processed in this chat,
+          sends a "⏳ Queueing..." notice so the user knows the message was received.
         """
         chat_id = getattr(event.source, "chat_id", "") or "" if event.source else ""
         chat_lock = self._get_chat_lock(chat_id)
+        # CRITICAL FIX: Notify user when their message is queued behind a
+        # long-running task in the same chat. Without this, users think the
+        # bot is dead silent for minutes.
+        if chat_lock.locked():
+            try:
+                await self.send(
+                    chat_id,
+                    "⏳ Another message is still being processed in this chat. "
+                    "Your message has been queued and will be handled next.",
+                    metadata=getattr(event, "metadata", None),
+                )
+            except Exception:
+                pass
         async with chat_lock:
             await self.handle_message(event)
 
@@ -2880,7 +3236,9 @@ class FeishuAdapter(BasePlatformAdapter):
         current_task = asyncio.current_task()
         try:
             await asyncio.sleep(self._media_batch_delay_seconds)
-            await self._flush_media_batch_now(key)
+            # Shield the actual flush so a cancellation does not interrupt
+            # message dispatch mid-work.
+            await asyncio.shield(self._flush_media_batch_now(key))
         finally:
             if self._pending_media_batch_tasks.get(key) is current_task:
                 self._pending_media_batch_tasks.pop(key, None)
@@ -2913,7 +3271,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
         import httpx
 
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, limits=DEFAULT_HTTPX_LIMITS) as client:
             response = await client.get(
                 file_url,
                 headers={
@@ -3128,9 +3486,12 @@ class FeishuAdapter(BasePlatformAdapter):
         )
 
     async def _enqueue_text_event(self, event: MessageEvent) -> None:
-        """Debounce rapid Feishu text bursts into a single MessageEvent."""
+        """Debounce rapid Feishu text bursts into a single MessageEvent.
+        
+        P0 Fix: Uses UTF-16 length for accurate counting (especially emoji).
+        """
         key = self._text_batch_key(event)
-        chunk_len = len(event.text or "")
+        chunk_len = utf16_len(event.text or "")
         existing = self._pending_text_batches.get(key)
         if existing is None:
             event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
@@ -3150,7 +3511,7 @@ class FeishuAdapter(BasePlatformAdapter):
         next_count = existing_count + 1
         appended_text = event.text or ""
         next_text = f"{existing.text}\n{appended_text}" if existing.text and appended_text else (existing.text or appended_text)
-        if next_count > self._text_batch_max_messages or len(next_text) > self._text_batch_max_chars:
+        if next_count > self._text_batch_max_messages or utf16_len(next_text) > self._text_batch_max_chars:
             await self._flush_text_batch_now(key)
             self._pending_text_batches[key] = event
             self._pending_text_batch_counts[key] = 1
@@ -3201,7 +3562,9 @@ class FeishuAdapter(BasePlatformAdapter):
             else:
                 delay = self._text_batch_delay_seconds
             await asyncio.sleep(delay)
-            await self._flush_text_batch_now(key)
+            # Shield the actual flush so a cancellation (from a newer batch
+            # arriving) does not interrupt message dispatch mid-work.
+            await asyncio.shield(self._flush_text_batch_now(key))
         finally:
             if self._pending_text_batch_tasks.get(key) is current_task:
                 self._pending_text_batch_tasks.pop(key, None)
@@ -3213,9 +3576,9 @@ class FeishuAdapter(BasePlatformAdapter):
         if not event:
             return
         logger.info(
-            "[Feishu] Flushing text batch %s (%d chars)",
+            "[Feishu] Flushing text batch %s (%d UTF-16 chars)",
             key,
-            len(event.text or ""),
+            utf16_len(event.text or ""),
         )
         await self._handle_message_with_guards(event)
 
@@ -4062,14 +4425,16 @@ class FeishuAdapter(BasePlatformAdapter):
         payload: str,
         reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]],
+        uuid_value: Optional[str] = None,
     ) -> Any:
         reply_in_thread = bool((metadata or {}).get("thread_id"))
+        _uuid = uuid_value or str(uuid.uuid4())
         if reply_to:
             body = self._build_reply_message_body(
                 content=payload,
                 msg_type=msg_type,
                 reply_in_thread=reply_in_thread,
-                uuid_value=str(uuid.uuid4()),
+                uuid_value=_uuid,
             )
             request = self._build_reply_message_request(reply_to, body)
             return await asyncio.to_thread(self._client.im.v1.message.reply, request)
@@ -4078,7 +4443,7 @@ class FeishuAdapter(BasePlatformAdapter):
             receive_id=chat_id,
             msg_type=msg_type,
             content=payload,
-            uuid_value=str(uuid.uuid4()),
+            uuid_value=_uuid,
         )
         request = self._build_create_message_request("chat_id", body)
         return await asyncio.to_thread(self._client.im.v1.message.create, request)
@@ -4208,6 +4573,10 @@ class FeishuAdapter(BasePlatformAdapter):
     ) -> Any:
         last_error: Optional[Exception] = None
         active_reply_to = reply_to
+        # Re-use the same UUID across retries so Feishu treats them as idempotent.
+        # If the first attempt actually succeeded (e.g. network timeout after delivery),
+        # a retry with the same UUID will not create a duplicate message.
+        _uuid = str(uuid.uuid4())
         for attempt in range(_FEISHU_SEND_ATTEMPTS):
             try:
                 response = await self._send_raw_message(
@@ -4216,6 +4585,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     payload=payload,
                     reply_to=active_reply_to,
                     metadata=metadata,
+                    uuid_value=_uuid,
                 )
                 # If replying to a message failed because it was withdrawn or not found,
                 # fall back to posting a new message directly to the chat.
@@ -4230,12 +4600,16 @@ class FeishuAdapter(BasePlatformAdapter):
                             chat_id,
                         )
                         active_reply_to = None
+                        # Fallback to a new top-level message: generate a fresh UUID
+                        # because the reply attempt failed for business reasons, not
+                        # transient network errors.
                         response = await self._send_raw_message(
                             chat_id=chat_id,
                             msg_type=msg_type,
                             payload=payload,
                             reply_to=None,
                             metadata=metadata,
+                            uuid_value=str(uuid.uuid4()),
                         )
                 return response
             except Exception as exc:

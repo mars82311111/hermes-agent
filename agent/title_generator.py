@@ -62,6 +62,9 @@ def generate_title(
             main_runtime=main_runtime,
         )
         title = (response.choices[0].message.content or "").strip()
+        # Strip reasoning tags (e.g. <think>...</think>) that some models return
+        import re
+        title = re.sub(r"<think>.*?</think>", "", title, flags=re.DOTALL).strip()
         # Clean up: remove quotes, trailing punctuation, prefixes like "Title: "
         title = title.strip('"\'')
         if title.lower().startswith("title:"):

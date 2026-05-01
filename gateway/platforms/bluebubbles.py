@@ -29,6 +29,7 @@ from gateway.platforms.base import (
     cache_image_from_bytes,
     cache_audio_from_bytes,
     cache_document_from_bytes,
+    DEFAULT_HTTPX_LIMITS,
 )
 from gateway.platforms.helpers import strip_markdown
 
@@ -162,7 +163,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             return False
         from aiohttp import web
 
-        self.client = httpx.AsyncClient(timeout=30.0)
+        self.client = httpx.AsyncClient(timeout=30.0, limits=DEFAULT_HTTPX_LIMITS)
         try:
             await self._api_get("/api/v1/ping")
             info = await self._api_get("/api/v1/server/info")

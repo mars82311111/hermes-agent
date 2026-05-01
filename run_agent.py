@@ -128,6 +128,13 @@ from tools.browser_tool import cleanup_browser
 
 # Agent internals extracted to agent/ package for modularity
 from agent.memory_manager import StreamingContextScrubber, build_memory_context_block, sanitize_context
+from agent.cognitive_state import (
+    load_cognitive_state, save_cognitive_state, create_default_state,
+    update_focus, add_correction, add_decision, set_stage, increment_turn,
+    check_output_violations, build_correction_prompt,
+    generate_predictive_queries, detect_corrections_from_turn,
+    format_state_for_system_prompt,
+)
 from agent.retry_utils import jittered_backoff
 from agent.error_classifier import classify_api_error, FailoverReason
 from agent.prompt_builder import (
@@ -1309,6 +1316,20 @@ class AIAgent:
         # same image history.
         self._anthropic_image_fallback_cache: Dict[str, str] = {}
 
+        # =====================================================================
+        # Cognitive State — deterministic continuity layer
+        # =====================================================================
+        # Unlike probabilistic memory retrieval, cognitive state is always
+        # loaded and directly drives pre-output guardrails.
+        self._cognitive_state: Dict[str, Any] = {}
+        self._cognitive_state_loaded: bool = False
+        self._cognitive_state_dirty: bool = False
+        # Pre-output guardrail: max retries when violation detected
+        self._guardrail_max_retries: int = 2
+        self._guardrail_retry_count: int = 0
+        # Predictive search queries from cognitive state
+        self._predictive_queries: List[str] = []
+
         # Initialize LLM client via centralized provider router.
         # The router handles auth resolution, base URL, headers, and
         # Codex/Anthropic wrapping for all known providers.
@@ -1434,7 +1455,7 @@ class AIAgent:
                     client_kwargs["default_headers"] = copilot_default_headers()
                 elif base_url_host_matches(effective_base, "api.kimi.com"):
                     client_kwargs["default_headers"] = {
-                        "User-Agent": "claude-code/0.1.0",
+                        "User-Agent": "KimiCLI/1.30.0",
                     }
                 elif base_url_host_matches(effective_base, "portal.qwen.ai"):
                     client_kwargs["default_headers"] = _qwen_portal_headers()
@@ -1620,6 +1641,9 @@ class AIAgent:
         
         # Cached system prompt -- built once per session, only rebuilt on compression
         self._cached_system_prompt: Optional[str] = None
+        
+        # Active task tracking -- persists across turns, guides context compression
+        self._active_task: Optional[str] = None
         
         # Filesystem checkpoint manager (transparent — not a tool)
         from tools.checkpoint_manager import CheckpointManager
@@ -2279,7 +2303,11 @@ class AIAgent:
         old_provider = self.provider
 
         # ── Swap core runtime fields ──
-        self.model = new_model
+        try:
+            from hermes_cli.model_normalize import normalize_model_for_provider
+            self.model = normalize_model_for_provider(new_model, new_provider)
+        except Exception:
+            self.model = new_model
         self.provider = new_provider
         self.base_url = base_url or self.base_url
         self.api_mode = api_mode
@@ -3319,7 +3347,10 @@ class AIAgent:
         "preferences, or personal details worth remembering?\n"
         "2. Has the user expressed expectations about how you should behave, their work "
         "style, or ways they want you to operate?\n\n"
-        "If something stands out, save it using the memory tool. "
+        "CRITICAL: Use memory_store tool to save important facts to hermes_memory (LanceDB), "
+        "NOT the built-in memory tool. hermes_memory has unlimited space and is the primary "
+        "long-term storage. Save with category='fact' and importance=0.8 or higher.\n\n"
+        "If something stands out, save it using the memory_store tool. "
         "If nothing is worth saving, just say 'Nothing to save.' and stop."
     )
 
@@ -3400,59 +3431,18 @@ class AIAgent:
     )
 
     _COMBINED_REVIEW_PROMPT = (
-        "Review the conversation above and update two things:\n\n"
-        "**Memory**: who the user is. Did the user reveal persona, "
-        "desires, preferences, personal details, or expectations about "
-        "how you should behave? Save facts about the user and durable "
-        "preferences with the memory tool.\n\n"
-        "**Skills**: how to do this class of task. Be ACTIVE — most "
-        "sessions produce at least one skill update. A pass that does "
-        "nothing is a missed learning opportunity, not a neutral outcome.\n\n"
-        "Target shape of the skill library: CLASS-LEVEL skills with a rich "
-        "SKILL.md and a `references/` directory for session-specific detail. "
-        "Not a long flat list of narrow one-session-one-skill entries.\n\n"
-        "Signals that warrant a skill update (any one is enough):\n"
-        "  • User corrected your style, tone, format, legibility, "
-        "verbosity, or approach. Frustration is a FIRST-CLASS skill "
-        "signal, not just a memory signal. 'stop doing X', 'don't format "
-        "like this', 'I hate when you Y' — embed the lesson in the skill "
-        "that governs that task so the next session starts fixed.\n"
-        "  • Non-trivial technique, fix, workaround, or debugging path "
-        "emerged.\n"
-        "  • A skill that was loaded or consulted turned out wrong, "
-        "missing, or outdated — patch it now.\n\n"
-        "Preference order for skills — pick the earliest that fits:\n"
-        "  1. UPDATE A CURRENTLY-LOADED SKILL. Check what skills were "
-        "loaded via /skill-name or skill_view in the conversation. If one "
-        "of them covers the learning, PATCH it first. It was in play; "
-        "it's the right place.\n"
-        "  2. UPDATE AN EXISTING UMBRELLA (skills_list + skill_view to "
-        "find the right one). Patch it.\n"
-        "  3. ADD A SUPPORT FILE under an existing umbrella via "
-        "skill_manage action=write_file. Three kinds: "
-        "`references/<topic>.md` for session-specific detail OR condensed "
-        "knowledge banks (quoted research, API docs excerpts, domain "
-        "notes) written concise and task-focused; `templates/<name>.<ext>` "
-        "for starter files meant to be copied and modified; "
-        "`scripts/<name>.<ext>` for statically re-runnable actions "
-        "(verification, fixture generators, probes). Add a one-line "
-        "pointer in SKILL.md so future agents find them.\n"
-        "  4. CREATE A NEW CLASS-LEVEL UMBRELLA when nothing exists. "
-        "Name at the class level — NOT a PR number, error string, "
-        "codename, library-alone name, or 'fix-X / debug-Y' session "
-        "artifact. If the name only fits today's task, fall back to (1), "
-        "(2), or (3).\n\n"
-        "User-preference embedding: when the user complains about how "
-        "you handled a task, update the skill that governs that task — "
-        "memory alone isn't enough. Memory says 'who the user is and "
-        "what the current situation and state of your operations are'; "
-        "skills say 'how to do this class of task for this user'. Both "
-        "should carry user-preference lessons when relevant.\n\n"
-        "If you notice overlapping existing skills, mention it — the "
-        "background curator handles consolidation.\n\n"
-        "Act on whichever of the two dimensions has real signal. If "
-        "genuinely nothing stands out on either, say 'Nothing to save.' "
-        "and stop — but don't reach for that conclusion as a default."
+        "Review the conversation above and consider two things:\n\n"
+        "**Memory**: Has the user revealed things about themselves — their persona, "
+        "desires, preferences, or personal details? Has the user expressed expectations "
+        "about how you should behave, their work style, or ways they want you to operate? "
+        "CRITICAL: Use memory_store tool to save to hermes_memory (LanceDB), NOT built-in memory. "
+        "Save with category='fact' and importance=0.8+.\n\n"
+        "**Skills**: Was a non-trivial approach used to complete a task that required trial "
+        "and error, or changing course due to experiential findings along the way, or did "
+        "the user expect or desire a different method or outcome? If a relevant skill "
+        "already exists, update it. Otherwise, create a new one if the approach is reusable.\n\n"
+        "Only act if there's something genuinely worth saving. "
+        "If nothing stands out, just say 'Nothing to save.' and stop."
     )
 
     @staticmethod
@@ -4957,7 +4947,25 @@ class AIAgent:
         if self.provider:
             timestamp_line += f"\nProvider: {self.provider}"
         prompt_parts.append(timestamp_line)
-
+        
+        # Active task: inject current focus so the model never loses track
+        # of what the user asked for, even after heavy context compression.
+        if self._active_task:
+            prompt_parts.append(f"\u5f53\u524d\u4efb\u52a1: {self._active_task}")
+        
+        # =====================================================================
+        # COGNITIVE STATE — inject deterministic context into system prompt
+        # =====================================================================
+        # This is NOT memory retrieval (which is probabilistic). Cognitive state
+        # is always loaded, always injected, and always up-to-date. It ensures
+        # the model knows: current focus, recent corrections, error immunity,
+        # active project, and conversation stage — even after agent restart.
+        if self._cognitive_state:
+            _cog_text = format_state_for_system_prompt(self._cognitive_state)
+            if _cog_text:
+                prompt_parts.append(_cog_text)
+        # =====================================================================
+        
         # Alibaba Coding Plan API always returns "glm-4.7" as model name regardless
         # of the requested model. Inject explicit model identity into the system prompt
         # so the agent can correctly report which model it is (workaround for API bug).
@@ -5437,7 +5445,10 @@ class AIAgent:
             # loopback / local endpoints such as a locally hosted sub2api.
             _proxy = _get_proxy_for_base_url(base_url)
             return _httpx.Client(
-                transport=_httpx.HTTPTransport(socket_options=_sock_opts),
+                transport=_httpx.HTTPTransport(
+                    socket_options=_sock_opts,
+                    limits=_httpx.Limits(max_connections=20, max_keepalive_connections=5),
+                ),
                 proxy=_proxy,
             )
         except Exception:
@@ -10381,6 +10392,58 @@ class AIAgent:
         # child-launch time see the parent's real id, not None.
         self._current_task_id = effective_task_id
         
+        # Track active task from user message for context compression focus
+        # Skip system notes and synthetic prefixes; use the real user intent
+        _raw_task = (persist_user_message or user_message or "").strip()
+        _note_marker = "[System note:"
+        if _note_marker in _raw_task:
+            _after_note = _raw_task.split(_note_marker, 1)[1]
+            if "\n\n" in _after_note:
+                _raw_task = _after_note.split("\n\n", 1)[1]
+            else:
+                _raw_task = _after_note
+        _clean_task = _raw_task.strip()[:100]
+        if _clean_task and _clean_task != (self._active_task or ""):
+            self._active_task = _clean_task
+            self._invalidate_system_prompt()
+        
+        # =====================================================================
+        # COGNITIVE STATE — Pre-dialogue hydration
+        # =====================================================================
+        # Load deterministic cognitive state that survives agent instance
+        # destruction (gateway cache eviction, etc.). This is NOT probabilistic
+        # memory retrieval — it always loads, always injects, always works.
+        if not self._cognitive_state_loaded:
+            self._cognitive_state = load_cognitive_state(self.session_id or "default")
+            if not self._cognitive_state:
+                self._cognitive_state = create_default_state()
+            self._cognitive_state_loaded = True
+            logger.info("Cognitive state loaded for session %s: focus=%r stage=%r",
+                        self.session_id,
+                        self._cognitive_state.get("current_focus", ""),
+                        self._cognitive_state.get("conversation_stage", ""))
+        
+        # Update focus from current message
+        if _clean_task:
+            self._cognitive_state = update_focus(self._cognitive_state, _clean_task)
+            self._cognitive_state_dirty = True
+        
+        # Increment turn counter
+        self._cognitive_state = increment_turn(self._cognitive_state)
+        self._cognitive_state_dirty = True
+        
+        # Reset guardrail retry counter for new turn
+        self._guardrail_retry_count = 0
+        
+        # Generate predictive search queries for memory prefetch
+        self._predictive_queries = generate_predictive_queries(
+            _raw_task, self._cognitive_state
+        )
+        if self._predictive_queries:
+            logger.info("Predictive queries: %s", self._predictive_queries)
+        
+        # =====================================================================
+        
         # Reset retry counters and iteration budget at the start of each turn
         # so subagent usage from a previous turn doesn't eat into the next one.
         self._invalid_tool_retries = 0
@@ -10573,6 +10636,7 @@ class AIAgent:
                     messages, active_system_prompt = self._compress_context(
                         messages, system_message, approx_tokens=_preflight_tokens,
                         task_id=effective_task_id,
+                        focus_topic=self._active_task,
                     )
                     if len(messages) >= _orig_len:
                         break  # Cannot compress further
@@ -10679,11 +10743,44 @@ class AIAgent:
         # prefetch_all() on each tool call (10 tool calls = 10x latency + cost).
         # Use original_user_message (clean input) — user_message may contain
         # injected skill content that bloats / breaks provider queries.
+        #
+        # COGNITIVE STATE: Also search with predictive queries generated from
+        # the cognitive state (current focus, project, recent corrections).
+        # This ensures we recall relevant context even when the user's message
+        # doesn't contain explicit keywords.
         _ext_prefetch_cache = ""
+        _intent_confirmation_message = ""
+        _intent_confirmation_needed = False
         if self._memory_manager:
             try:
                 _query = original_user_message if isinstance(original_user_message, str) else ""
-                _ext_prefetch_cache = self._memory_manager.prefetch_all(_query) or ""
+                # Primary query: user's message
+                _all_results = self._memory_manager.prefetch_all(_query) or ""
+                
+                # Predictive queries from cognitive state
+                for _pq in self._predictive_queries:
+                    if _pq and _pq != _query:
+                        _pq_result = self._memory_manager.prefetch_all(_pq) or ""
+                        if _pq_result:
+                            _all_results += "\n\n" + _pq_result
+                
+                # Deduplicate by hashing lines (simple dedup)
+                if _all_results:
+                    seen = set()
+                    unique_lines = []
+                    for line in _all_results.split("\n"):
+                        line_hash = hash(line.strip())
+                        if line_hash not in seen and line.strip():
+                            seen.add(line_hash)
+                            unique_lines.append(line)
+                    _ext_prefetch_cache = "\n".join(unique_lines)
+                
+                # INTENT GATE (2026-05-01): Check if memory provider returned
+                # a confirmation request instead of memory results
+                if "[INTENT_CONFIRMATION_NEEDED]" in _ext_prefetch_cache:
+                    _intent_confirmation_message = _ext_prefetch_cache.replace("[INTENT_CONFIRMATION_NEEDED]\n", "")
+                    _intent_confirmation_needed = True
+                    _ext_prefetch_cache = ""  # Don't inject confirmation into LLM context
             except Exception:
                 pass
 
@@ -12204,6 +12301,7 @@ class AIAgent:
                                 messages, system_message,
                                 approx_tokens=approx_tokens,
                                 task_id=effective_task_id,
+                                focus_topic=self._active_task,
                             )
                             # Compression created a new session — clear history
                             # so _flush_messages_to_session_db writes compressed
@@ -12334,6 +12432,7 @@ class AIAgent:
                         messages, active_system_prompt = self._compress_context(
                             messages, system_message, approx_tokens=approx_tokens,
                             task_id=effective_task_id,
+                            focus_topic=self._active_task,
                         )
                         # Compression created a new session — clear history
                         # so _flush_messages_to_session_db writes compressed
@@ -12491,6 +12590,7 @@ class AIAgent:
                         messages, active_system_prompt = self._compress_context(
                             messages, system_message, approx_tokens=approx_tokens,
                             task_id=effective_task_id,
+                            focus_topic=self._active_task,
                         )
                         # Compression created a new session — clear history
                         # so _flush_messages_to_session_db writes compressed
@@ -13260,6 +13360,7 @@ class AIAgent:
                             messages, system_message,
                             approx_tokens=self.context_compressor.last_prompt_tokens,
                             task_id=effective_task_id,
+                            focus_topic=self._active_task,
                         )
                         # Compression created a new session — clear history so
                         # _flush_messages_to_session_db writes compressed messages
@@ -13755,6 +13856,9 @@ class AIAgent:
             "cost_status": self.session_cost_status,
             "cost_source": self.session_cost_source,
         }
+        # INTENT GATE (2026-05-01): Include confirmation message if intent needs clarification
+        if _intent_confirmation_needed and _intent_confirmation_message:
+            result["intent_confirmation_message"] = _intent_confirmation_message
         if self._tool_guardrail_halt_decision is not None:
             result["guardrail"] = self._tool_guardrail_halt_decision.to_metadata()
         # If a /steer landed after the final assistant turn (no more tool
@@ -13824,6 +13928,83 @@ class AIAgent:
             )
         except Exception as exc:
             logger.warning("on_session_end hook failed: %s", exc)
+
+        # =====================================================================
+        # COGNITIVE STATE — Pre-output guardrail + Post-dialogue evolution
+        # =====================================================================
+        # 1. Pre-output guardrail: check if final_response violates error immunity
+        #    If violated, regenerate with correction prompt (up to max retries)
+        if final_response and self._cognitive_state:
+            _violations = check_output_violations(
+                final_response,
+                self._cognitive_state.get("error_immunity", [])
+            )
+            if _violations and self._guardrail_retry_count < self._guardrail_max_retries:
+                self._guardrail_retry_count += 1
+                logger.warning(
+                    "Guardrail triggered: %d violation(s) detected, retry %d/%d",
+                    len(_violations), self._guardrail_retry_count, self._guardrail_max_retries
+                )
+                _correction_prompt = build_correction_prompt(_violations, final_response)
+                # Inject correction as a user message and force one more iteration
+                messages.append({"role": "user", "content": _correction_prompt})
+                # Force one more API call
+                self._budget_grace_call = True
+                # Re-enter the loop for one more iteration
+                # Note: this is a simplified approach — the loop has already exited,
+                # so we do a single correction call here
+                try:
+                    _corr_messages = [{"role": "system", "content": active_system_prompt or ""}] + messages
+                    _corr_response = self.client.chat.completions.create(
+                        model=self.model,
+                        messages=_corr_messages,
+                        tools=self.tools,
+                    )
+                    if _corr_response.choices:
+                        final_response = _corr_response.choices[0].message.content or ""
+                        result["final_response"] = final_response
+                except Exception as e:
+                    logger.error("Guardrail correction call failed: %s", e)
+        
+        # 2. Post-dialogue: detect corrections, update cognitive state, save
+        if self._cognitive_state:
+            # Detect corrections from the turn
+            _new_corrections = detect_corrections_from_turn(messages)
+            for corr in _new_corrections:
+                self._cognitive_state = add_correction(
+                    self._cognitive_state,
+                    corr["error_type"],
+                    corr["description"],
+                    corr["trigger_pattern"],
+                    corr["correct_action"],
+                    corr.get("importance", 0.9)
+                )
+                self._cognitive_state_dirty = True
+                logger.info("Detected correction: %s", corr["description"][:80])
+            
+            # Update conversation stage based on turn outcome
+            if interrupted:
+                self._cognitive_state = set_stage(self._cognitive_state, "error")
+            elif api_call_count >= self.max_iterations:
+                self._cognitive_state = set_stage(self._cognitive_state, "error")
+            elif completed:
+                self._cognitive_state = set_stage(self._cognitive_state, "done")
+            else:
+                self._cognitive_state = set_stage(self._cognitive_state, "execute")
+            self._cognitive_state_dirty = True
+            
+            # Save cognitive state if dirty
+            if self._cognitive_state_dirty:
+                try:
+                    save_cognitive_state(
+                        self.session_id or "default",
+                        self._cognitive_state
+                    )
+                    self._cognitive_state_dirty = False
+                    logger.info("Cognitive state saved for session %s", self.session_id)
+                except Exception as e:
+                    logger.error("Failed to save cognitive state: %s", e)
+        # =====================================================================
 
         return result
 

@@ -16,7 +16,7 @@ class TestMinimaxContextLengths:
     def test_minimax_models_resolve_via_prefix(self):
         from agent.model_metadata import get_model_context_length
         # All MiniMax models should resolve to 204,800 via the "minimax" prefix
-        for model in ("MiniMax-M2.7", "MiniMax-M2.5", "MiniMax-M2.1", "MiniMax-M2"):
+        for model in ("MiniMax-M2.7-highspeed",):
             ctx = get_model_context_length(model, "")
             assert ctx == 204_800, f"{model} expected 204800, got {ctx}"
 
@@ -31,10 +31,10 @@ class TestMinimaxThinkingSupport:
     thinking (which is Claude 4.6-only).
     """
 
-    def test_minimax_m27_gets_manual_thinking(self):
+    def test_minimax_m27_highspeed_gets_manual_thinking(self):
         from agent.anthropic_adapter import build_anthropic_kwargs
         kwargs = build_anthropic_kwargs(
-            model="MiniMax-M2.7",
+            model="MiniMax-M2.7-highspeed",
             messages=[{"role": "user", "content": "hello"}],
             tools=None,
             max_tokens=4096,
@@ -45,18 +45,6 @@ class TestMinimaxThinkingSupport:
         assert "budget_tokens" in kwargs["thinking"]
         # MiniMax should NOT get adaptive thinking or output_config
         assert "output_config" not in kwargs
-
-    def test_minimax_m25_gets_manual_thinking(self):
-        from agent.anthropic_adapter import build_anthropic_kwargs
-        kwargs = build_anthropic_kwargs(
-            model="MiniMax-M2.5",
-            messages=[{"role": "user", "content": "hello"}],
-            tools=None,
-            max_tokens=4096,
-            reasoning_config={"enabled": True, "effort": "high"},
-        )
-        assert "thinking" in kwargs
-        assert kwargs["thinking"]["type"] == "enabled"
 
     def test_thinking_still_works_for_claude(self):
         from agent.anthropic_adapter import build_anthropic_kwargs
@@ -73,15 +61,40 @@ class TestMinimaxThinkingSupport:
 class TestMinimaxAuxModel:
     """Verify auxiliary model is standard (not highspeed)."""
 
-    def test_minimax_aux_is_standard(self):
+    def test_minimax_aux_is_highspeed(self):
         from agent.auxiliary_client import _API_KEY_PROVIDER_AUX_MODELS
-        assert _API_KEY_PROVIDER_AUX_MODELS["minimax"] == "MiniMax-M2.7"
-        assert _API_KEY_PROVIDER_AUX_MODELS["minimax-cn"] == "MiniMax-M2.7"
+        assert _API_KEY_PROVIDER_AUX_MODELS["minimax"] == "MiniMax-M2.7-highspeed"
+        assert _API_KEY_PROVIDER_AUX_MODELS["minimax-cn"] == "MiniMax-M2.7-highspeed"
 
-    def test_minimax_aux_not_highspeed(self):
-        from agent.auxiliary_client import _API_KEY_PROVIDER_AUX_MODELS
-        assert "highspeed" not in _API_KEY_PROVIDER_AUX_MODELS["minimax"]
-        assert "highspeed" not in _API_KEY_PROVIDER_AUX_MODELS["minimax-cn"]
+
+class TestMinimaxModelCatalog:
+    """Verify the model catalog matches official Anthropic-compat endpoint models.
+
+    Source: https://platform.minimax.io/docs/api-reference/text-anthropic-api
+    """
+
+    def test_catalog_includes_current_models(self):
+        from hermes_cli.models import _PROVIDER_MODELS
+        for provider in ("minimax", "minimax-cn"):
+            models = _PROVIDER_MODELS[provider]
+            assert "MiniMax-M2.7-highspeed" in models
+
+    def test_catalog_excludes_m1_family(self):
+        """M1 models are not available on the /anthropic endpoint."""
+        from hermes_cli.models import _PROVIDER_MODELS
+        for provider in ("minimax", "minimax-cn"):
+            models = _PROVIDER_MODELS[provider]
+            assert "MiniMax-M1" not in models
+
+    def test_catalog_excludes_deprecated_models(self):
+        """Deprecated models (M2, M2.1, M2.5, standard M2.7) are removed."""
+        from hermes_cli.models import _PROVIDER_MODELS
+        for provider in ("minimax", "minimax-cn"):
+            models = _PROVIDER_MODELS[provider]
+            assert "MiniMax-M2" not in models
+            assert "MiniMax-M2.1" not in models
+            assert "MiniMax-M2.5" not in models
+            assert "MiniMax-M2.7" not in models
 
 
 class TestMinimaxBetaHeaders:
@@ -221,17 +234,9 @@ class TestMinimaxMaxOutput:
     cross-referenced with MiniMax API behavior).
     """
 
-    def test_minimax_m27_output_limit(self):
+    def test_minimax_m27_highspeed_output_limit(self):
         from agent.anthropic_adapter import _get_anthropic_max_output
-        assert _get_anthropic_max_output("MiniMax-M2.7") == 131_072
-
-    def test_minimax_m25_output_limit(self):
-        from agent.anthropic_adapter import _get_anthropic_max_output
-        assert _get_anthropic_max_output("MiniMax-M2.5") == 131_072
-
-    def test_minimax_m2_output_limit(self):
-        from agent.anthropic_adapter import _get_anthropic_max_output
-        assert _get_anthropic_max_output("MiniMax-M2") == 131_072
+        assert _get_anthropic_max_output("MiniMax-M2.7-highspeed") == 131_072
 
     def test_claude_output_unaffected(self):
         from agent.anthropic_adapter import _get_anthropic_max_output
@@ -242,7 +247,7 @@ class TestMinimaxMaxOutput:
 class TestMinimaxPreserveDots:
     """Verify that MiniMax model names preserve dots through the Anthropic adapter.
 
-    MiniMax model IDs like 'MiniMax-M2.7' must NOT have dots converted to
+    MiniMax model IDs like 'MiniMax-M2.7-highspeed' must NOT have dots converted to
     hyphens — the endpoint expects the exact name with dots.
     """
 
@@ -304,15 +309,15 @@ class TestMinimaxPreserveDots:
         from agent.anthropic_adapter import normalize_model_name
         assert normalize_model_name("minimax-m2.5-free", preserve_dots=True) == "minimax-m2.5-free"
 
-    def test_normalize_preserves_m27_dot(self):
+    def test_normalize_preserves_m27_highspeed_dot(self):
         from agent.anthropic_adapter import normalize_model_name
-        assert normalize_model_name("MiniMax-M2.7", preserve_dots=True) == "MiniMax-M2.7"
+        assert normalize_model_name("MiniMax-M2.7-highspeed", preserve_dots=True) == "MiniMax-M2.7-highspeed"
 
     def test_normalize_preserves_non_anthropic_dots_without_preserve(self):
         from agent.anthropic_adapter import normalize_model_name
         # Non-Anthropic model families use dots as canonical version separators;
         # only Claude/Anthropic names are hyphen-normalized by default.
-        assert normalize_model_name("MiniMax-M2.7", preserve_dots=False) == "MiniMax-M2.7"
+        assert normalize_model_name("MiniMax-M2.7-highspeed", preserve_dots=False) == "MiniMax-M2.7-highspeed"
 
     def test_normalize_still_converts_claude_dots_without_preserve(self):
         from agent.anthropic_adapter import normalize_model_name
@@ -353,7 +358,7 @@ class TestMinimaxSwitchModelCredentialGuard:
              patch("agent.anthropic_adapter._is_oauth_token", return_value=False):
 
             agent.switch_model(
-                new_model="MiniMax-M2.7",
+                new_model="MiniMax-M2.7-highspeed",
                 new_provider="minimax",
                 api_mode="anthropic_messages",
                 api_key="mm-key-123",

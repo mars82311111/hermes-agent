@@ -1,0 +1,1463 @@
+#!/usr/bin/env python3
+"""
+Hermes Memory Provider - 融合MemPalace和memory-lancedb-pro的统一记忆系统
+
+融合架构:
+├── LanceDB Storage (向量+BM25) ← memory-lancedb-pro
+├── SQLite KG (三元组) ← MemPalace
+├── Hybrid Retriever ← memory-lancedb-pro  
+├── Weibull Decay Engine ← memory-lancedb-pro
+├── Working Memory + WAL ← MemPalace
+├── Noise Filter + Adaptive ← memory-lancedb-pro
+└── Scope Isolation ← memory-lancedb-pro
+"""
+
+import json
+import logging
+import os
+import threading
+import time
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger("hermes_memory")
+
+def _get_table_names(db) -> list:
+    """COMPAT: LanceDB list_tables() returns ListTablesResponse in 0.30+, 
+    table_names() returns list but is deprecated."""
+    try:
+        resp = db.list_tables()
+        if hasattr(resp, "tables"):
+            return resp.tables
+        return list(resp)
+    except Exception:
+        # Fallback to deprecated API
+        return db.table_names()
+
+
+# Default paths
+DEFAULT_MEMORY_PATH = Path.home() / ".hermes"
+DEFAULT_LANCE_PATH = DEFAULT_MEMORY_PATH / "memory.lance"
+DEFAULT_KG_PATH = DEFAULT_MEMORY_PATH / "kg.sqlite3"
+DEFAULT_PALACE_PATH = Path.home() / ".mempalace_hermes"
+
+
+# =============================================================================
+# Import all components
+# =============================================================================
+
+try:
+    from .lancedb_storage import LanceDBStorage, MemoryEntry
+    from .hybrid_retriever import HybridRetriever, JinaEmbedder, LocalEmbedder, create_embedder
+    from .decay_engine import DecayEngine, DecayConfig, DEFAULT_DECAY_CONFIG, DecayableMemory
+    from .tier_manager import TierManager, DEFAULT_TIER_CONFIG, MemoryTier
+    from .access_tracker import AccessTracker
+    from .kg_integration import KGIntegration, kg_search, add_triple_with_entity
+    from .working_memory import WorkingMemory, MAX_WORKING_MEMORY_TURNS
+    from .wal_manager import WALManager
+    from .smart_extractor import smart_extract, queue_extraction
+    from .noise_filter import is_noise
+    from .adaptive_retrieval import should_skip_retrieval, should_confirm_intent, build_intent_confirmation_card
+    from .scope_isolation import Scope, can_access, ScopeGuard
+except ImportError as e:
+    logger.warning("Failed to import some components: %s", e)
+
+
+# =============================================================================
+# Memory Provider Interface
+# =============================================================================
+
+class HermesMemoryProvider:
+    """
+    融合后的Memory Provider
+    统一管理: LanceDB向量存储 + KG知识图谱 + WorkingMemory + WAL
+    """
+
+    def __init__(self):
+        self._config: Dict[str, Any] = {}
+        self._initialized = False
+        self._storage: Optional[LanceDBStorage] = None
+        self._retriever: Optional[HybridRetriever] = None
+        self._decay_engine: Optional[DecayEngine] = None
+        self._access_tracker: Optional[AccessTracker] = None
+        self._tier_manager: Optional[TierManager] = None
+        self._kg: Optional[KGIntegration] = None
+        self._working_memory: Optional[WorkingMemory] = None
+        self._wal: Optional[WALManager] = None
+        self._lock = threading.RLock()
+        # OPTIMIZATION: Query result cache (query_hash -> (timestamp, results))
+        self._query_cache: Dict[str, tuple[float, List[Dict[str, Any]]]] = {}
+        self._query_cache_ttl = 300.0  # 5 minutes
+        self._query_cache_max_size = 256  # Prevent unbounded growth
+        self._query_cache_lock = threading.Lock()
+        # OPTIMIZATION: Turn counter for periodic maintenance
+        self._turn_count = 0
+        self._maintenance_interval = 100  # Run maintenance every 100 turns
+        self._turn_count_lock = threading.Lock()
+
+    @property
+    def name(self) -> str:
+        return "hermes_memory"
+
+    def is_available(self) -> bool:
+        """检查所有依赖是否可用"""
+        try:
+            from .lancedb_storage import LanceDBStorage
+            return True
+        except ImportError:
+            return False
+
+    def get_config_schema(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "key": "memory_path",
+                "description": "记忆系统根目录",
+                "default": str(DEFAULT_MEMORY_PATH),
+            },
+            {
+                "key": "lance_path", 
+                "description": "LanceDB数据目录",
+                "default": str(DEFAULT_LANCE_PATH),
+            },
+            {
+                "key": "kg_path",
+                "description": "KG数据库路径",
+                "default": str(DEFAULT_KG_PATH),
+            },
+            {
+                "key": "embedding_provider",
+                "description": "Embedding提供商 (jina/openai)",
+                "default": "jina",
+            },
+            {
+                "key": "embedding_api_key",
+                "description": "Embedding API Key",
+                "default": "",
+            },
+        ]
+
+    # =============================================================================
+    # MemoryProvider Interface Implementation
+    # =============================================================================
+
+    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+        """Return tool schemas for this provider's tools."""
+        return [
+            {
+                "name": "memory_search",
+                "description": "Search long-term memory for relevant past information. Use when the user asks about previous conversations, decisions, or facts.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Search query"},
+                        "limit": {"type": "integer", "description": "Max results (default 10)"},
+                        "scope": {"type": "string", "description": "Scope filter (default 'global')"},
+                        "category": {"type": "string", "description": "Category filter"},
+                    },
+                    "required": ["query"],
+                },
+            },
+            {
+                "name": "memory_store",
+                "description": "Store important information to long-term memory. Use when user shares facts, preferences, or decisions.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string", "description": "Content to store"},
+                        "category": {"type": "string", "description": "Category (default 'other')"},
+                        "importance": {"type": "number", "description": "Importance 0-1 (default 0.5)"},
+                        "scope": {"type": "string", "description": "Scope (default 'global')"},
+                        "metadata": {"type": "object", "description": "Additional metadata"},
+                    },
+                    "required": ["text"],
+                },
+            },
+            {
+                "name": "memory_recall",
+                "description": "Recall a specific memory by ID.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "memory_id": {"type": "string", "description": "Memory ID to recall"},
+                    },
+                    "required": ["memory_id"],
+                },
+            },
+            {
+                "name": "memory_forget",
+                "description": "Delete a specific memory by ID.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "memory_id": {"type": "string", "description": "Memory ID to forget"},
+                    },
+                    "required": ["memory_id"],
+                },
+            },
+            {
+                "name": "memory_profile",
+                "description": "Get user's profile information extracted from memory.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "memory_kg_search",
+                "description": "Search the knowledge graph for facts.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Search query"},
+                        "limit": {"type": "integer", "description": "Max results (default 10)"},
+                    },
+                    "required": ["query"],
+                },
+            },
+            {
+                "name": "memory_stats",
+                "description": "Get memory system statistics.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ]
+
+    def system_prompt_block(self) -> str:
+        """Return text to include in the system prompt."""
+        return (
+            "<memory-provider>\n"
+            "Memory: hermes_memory (LanceDB + KG hybrid)\n"
+            "Use memory_search, memory_store, memory_profile, memory_kg_search tools.\n"
+            "</memory-provider>"
+        )
+
+    def prefetch(self, query: str, *, session_id: str = "") -> str:
+        """Recall relevant context for the upcoming turn.
+
+        Searches both the current session scope (if session_id is provided)
+        and the global scope, merging results for comprehensive recall.
+        
+        INTENT GATE (2026-05-01): If query contains ambiguous keywords,
+        return a confirmation prompt instead of executing retrieval.
+        """
+        if not self._initialized:
+            return ""
+        
+        # INTENT GATE: Check if query needs user confirmation before retrieval
+        # This prevents retrieving wrong memories due to ambiguous keywords
+        if should_confirm_intent(query):
+            confirmation_msg = build_intent_confirmation_card(query)
+            if confirmation_msg:
+                # Return special prefix that signals "needs user confirmation"
+                # The agent/gateway will detect this and prompt the user
+                logger.info("Intent gate triggered for query: %s", query[:50])
+                return f"[INTENT_CONFIRMATION_NEEDED]\n{confirmation_msg}"
+        
+        try:
+            all_results = []
+            # Search session scope first (more relevant)
+            if session_id:
+                session_results = self.search(query=query, limit=5, scope=session_id)
+                all_results.extend(session_results)
+            # Search global scope
+            global_results = self.search(query=query, limit=5, scope="global")
+            # Deduplicate by ID before merging
+            seen_ids = {r["id"] for r in all_results}
+            for r in global_results:
+                if r["id"] not in seen_ids:
+                    all_results.append(r)
+            if not all_results:
+                return ""
+            context_parts = []
+            for r in all_results[:5]:
+                text = r.get("text", "")
+                if text:
+                    context_parts.append(f"- {text[:200]}")
+            if context_parts:
+                return "\n".join(context_parts)
+        except Exception as e:
+            logger.debug("prefetch failed: %s", e)
+        return ""
+
+    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+        """Queue background recall for the next turn."""
+        pass  # We do synchronous prefetch, no background needed
+
+    # =========================================================================
+    # Auto-extraction rules for key facts (system-level, no LLM judgment needed)
+    # =========================================================================
+
+    _AUTO_EXTRACT_RULES = [
+        # (regex_pattern, category, importance, description)
+        (r'我(?:喜欢|偏好|习惯|讨厌|不要|希望|期望|想要|想|需要)',
+         'user_preference', 0.9, 'user preference'),
+        (r'(?:决定|选择|采用|确认使用|定为|设为|用|使用)\s*\S+',
+         'decision', 0.9, 'decision'),
+        (r'(?:不是|错了|纠正|应该|不应该|记住.*不要|别再|以后.*要|以后.*不要)',
+         'lesson', 0.95, 'correction/lesson'),
+        (r'(?:项目|状态|完成|进行中|阻塞|下一步|待办|已做|做完)',
+         'project_status', 0.85, 'project status'),
+        (r'(?:配置|设置|参数|路径|端口|版本|安装|环境)',
+         'system_config', 0.85, 'system config'),
+        (r'(?:归.*管|边界|授权|权限|负责|属于)',
+         'boundary', 0.9, 'boundary/ownership'),
+        (r'(?:密码|账号|token|key|api|密钥)',
+         'credential', 0.95, 'credential'),
+        (r'(?:风险|问题|bug|故障|错误|异常|警告)',
+         'issue', 0.9, 'issue/risk'),
+        (r'(?:授权|允许|同意|确认|批准)',
+         'authorization', 0.9, 'authorization'),
+    ]
+
+    @staticmethod
+    def _extract_key_sentences(text: str, pattern: str, max_sentences: int = 2) -> list:
+        """Extract sentences matching the given regex pattern."""
+        import re
+        sentences = re.split(r'[。！？\n]', text)
+        matches = []
+        for s in sentences:
+            s = s.strip()
+            if s and re.search(pattern, s):
+                matches.append(s)
+                if len(matches) >= max_sentences:
+                    break
+        return matches
+
+    def _auto_extract_and_store(self, text: str, scope: str = "global") -> None:
+        """Auto-extract key facts from text using rule engine and store to hermes_memory.
+
+        This is a system-level mechanism: no LLM judgment needed.
+        Rules are deterministic and stable.
+        """
+        import re
+        for pattern, category, importance, desc in self._AUTO_EXTRACT_RULES:
+            if re.search(pattern, text):
+                sentences = self._extract_key_sentences(text, pattern)
+                for sentence in sentences:
+                    # Skip if too short or too long
+                    if len(sentence) < 5 or len(sentence) > 300:
+                        continue
+                    # Deduplication: check if similar content already exists
+                    try:
+                        existing = self.search(query=sentence, limit=3, scope=scope)
+                        if any(sentence[:30] in (r.get("text", "")[:50] or "") for r in existing):
+                            continue  # Skip duplicate
+                    except Exception:
+                        pass  # If search fails, still store
+                    try:
+                        self.store(
+                            text=f"[{desc}] {sentence}",
+                            category=category,
+                            importance=importance,
+                            scope=scope,
+                            metadata={
+                                "auto_extracted": True,
+                                "extractor": "rule_engine",
+                                "source_text_preview": text[:100],
+                            }
+                        )
+                    except Exception as e:
+                        logger.debug("auto_extract store failed for %s: %s", desc, e)
+
+    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+        """Persist a completed turn to the backend.
+
+        OPTIMIZATION: Uses session_id as scope for session-isolated storage.
+        Falls back to 'global' if session_id is empty.
+
+        CRITICAL: Auto-extracts key facts from user_content using rule engine
+        and stores them with high importance. This is a system-level mechanism
+        that does NOT depend on LLM judgment.
+        """
+        if not self._initialized:
+            return
+        try:
+            scope = session_id if session_id else "global"
+            # Store user message (raw conversation)
+            if user_content.strip():
+                self.store(
+                    text=user_content,
+                    category="conversation",
+                    importance=0.5,
+                    scope=scope,
+                    role="user",
+                    speaker="user",
+                )
+                # AUTO-EXTRACT: System-level key fact extraction
+                self._auto_extract_and_store(user_content, scope=scope)
+            # Store assistant response (raw conversation)
+            if assistant_content.strip():
+                self.store(
+                    text=assistant_content,
+                    category="response",
+                    importance=0.5,
+                    scope=scope,
+                    role="assistant",
+                    speaker="hermes",
+                )
+            # OPTIMIZATION: Periodic maintenance (cleanup stale memories)
+            with self._turn_count_lock:
+                self._turn_count += 1
+                should_maintain = self._turn_count >= self._maintenance_interval
+                if should_maintain:
+                    self._turn_count = 0
+            if should_maintain:
+                self._run_maintenance()
+        except Exception as e:
+            # CRITICAL: sync_turn failures must be logged at ERROR level
+            # so operators can detect silent data loss. Do NOT downgrade to warning.
+            logger.error("sync_turn failed: %s: %s", type(e).__name__, e, exc_info=True)
+
+    def initialize(self, session_id: str, **kwargs) -> None:
+        """Initialize all components. Auto-detects best embedder (local > Jina).
+
+        CRITICAL FIX: Each component is wrapped in its own try/except so that
+        a failure in one component does not prevent the others from working.
+        This ensures the memory system can always auto-start in some capacity,
+        even if individual subsystems are degraded.
+        """
+        if self._initialized:
+            return
+
+        hermes_home = kwargs.get("hermes_home", os.path.expanduser("~/.hermes"))
+        
+        # CRITICAL FIX: Set offline mode BEFORE loading embedder to prevent HuggingFace timeout
+        import os as _os
+        _os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        _os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+        _os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+        _os.environ.setdefault("HF_HUB_DISABLE_AUTO_CONVERSION", "1")
+        _os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+        
+        # Load config
+        config_path = Path(hermes_home) / "hermes_memory.json"
+        if config_path.exists():
+            try:
+                self._config = json.loads(config_path.read_text())
+            except Exception:
+                pass
+
+        # Paths
+        memory_path = Path(self._config.get("memory_path", DEFAULT_MEMORY_PATH))
+        lance_path = Path(self._config.get("lance_path", DEFAULT_LANCE_PATH))
+        kg_path = Path(self._config.get("kg_path", DEFAULT_KG_PATH))
+        
+        # Ensure directories exist
+        memory_path.mkdir(parents=True, exist_ok=True)
+        lance_path.mkdir(parents=True, exist_ok=True)
+
+        # ── Embedder (best-effort) ───────────────────────────────────────────
+        prefer_local = self._config.get("prefer_local_embedder", True)
+        embedding_provider = self._config.get("embedding_provider")
+        embedding_model = self._config.get("embedding_model")
+        embedding_device = self._config.get("embedding_device")
+        try:
+            self._embedder = create_embedder(
+                prefer_local=prefer_local,
+                provider=embedding_provider,
+                model_name=embedding_model,
+                device=embedding_device,
+            )
+        except Exception as e:
+            logger.warning("Embedder initialization failed: %s. BM25-only mode.", e)
+            self._embedder = None
+
+        if self._embedder is None:
+            logger.warning("No embedder available. Running in BM25-only mode.")
+            # CRITICAL FIX: Detect existing table dimension instead of hardcoding 384
+            vector_dim = self._detect_existing_table_dim(lance_path) or 384
+        else:
+            vector_dim = self._embedder.dimensions
+            logger.info("Using embedder: %sd", vector_dim)
+
+        # Check if existing table has different dimension and migrate
+        try:
+            self._maybe_migrate_vector_dim(lance_path, vector_dim)
+        except Exception as e:
+            logger.error("Vector dimension migration failed: %s", e)
+
+        # ── Storage (LanceDB) ────────────────────────────────────────────────
+        try:
+            self._storage = LanceDBStorage(
+                db_path=str(lance_path),
+                vector_dim=vector_dim,
+            )
+            # Force table initialization to ensure FTS index is created
+            self._storage._get_table()
+            # CRITICAL FIX: Verify LanceDB integrity and auto-recover if corrupted
+            self._verify_and_recover_lancedb(lance_path)
+        except Exception as e:
+            logger.error("LanceDB storage initialization failed: %s", e)
+            raise  # Storage is critical — we cannot function without it
+
+        # ── Retriever ─────────────────────────────────────────────────────────
+        try:
+            self._retriever = HybridRetriever(
+                storage=self._storage,
+                embedder=self._embedder,
+            )
+        except Exception as e:
+            logger.error("HybridRetriever initialization failed: %s", e)
+            self._retriever = None
+
+        # ── Decay Engine ──────────────────────────────────────────────────────
+        try:
+            self._decay_engine = DecayEngine(config=DEFAULT_DECAY_CONFIG)
+        except Exception as e:
+            logger.warning("DecayEngine initialization failed: %s", e)
+            self._decay_engine = None
+
+        # ── Access Tracker ────────────────────────────────────────────────────
+        try:
+            self._access_tracker = AccessTracker(
+                store=self._storage,
+                debounce_ms=5000,
+            )
+        except Exception as e:
+            logger.warning("AccessTracker initialization failed: %s", e)
+            self._access_tracker = None
+
+        # ── Tier Manager ──────────────────────────────────────────────────────
+        try:
+            self._tier_manager = TierManager(config=DEFAULT_TIER_CONFIG)
+        except Exception as e:
+            logger.warning("TierManager initialization failed: %s", e)
+            self._tier_manager = None
+
+        # ── KG Integration (best-effort) ──────────────────────────────────────
+        try:
+            self._kg = KGIntegration(kg_path=str(kg_path))
+        except Exception as e:
+            logger.warning("KGIntegration initialization failed: %s", e)
+            self._kg = None
+
+        # ── Working Memory ────────────────────────────────────────────────────
+        try:
+            self._working_memory = WorkingMemory(
+                max_turns=self._config.get("working_memory_limit", MAX_WORKING_MEMORY_TURNS),
+            )
+        except Exception as e:
+            logger.warning("WorkingMemory initialization failed: %s", e)
+            self._working_memory = WorkingMemory()
+
+        # ── WAL Manager ───────────────────────────────────────────────────────
+        try:
+            self._wal = WALManager(
+                storage=self._storage,
+                flush_interval=self._config.get("wal_flush_interval", 30),
+            )
+        except Exception as e:
+            logger.warning("WALManager initialization failed: %s", e)
+            self._wal = None
+
+        self._initialized = True
+        logger.info("HermesMemoryProvider initialized: memory_path=%s, lance_path=%s", 
+                    memory_path, lance_path)
+
+    def _detect_existing_table_dim(self, lance_path: Path) -> Optional[int]:
+        """Detect vector dimension of existing 'memories' table, or None if no table."""
+        try:
+            import lancedb
+            db = lancedb.connect(str(lance_path))
+            if "memories" not in _get_table_names(db):
+                return None
+            table = db.open_table("memories")
+            schema = table.schema
+            vector_field = schema.field("vector")
+            return int(vector_field.type.list_size)
+        except Exception:
+            return None
+
+    def _maybe_migrate_vector_dim(self, lance_path: Path, target_dim: int) -> None:
+        """Migrate existing data if vector dimension changed (e.g. 384 -> 1024)."""
+        try:
+            import lancedb
+            db = lancedb.connect(str(lance_path))
+            if "memories" not in _get_table_names(db):
+                return  # No existing table
+
+            table = db.open_table("memories")
+            # Check current vector dimension from schema
+            schema = table.schema
+            vector_field = schema.field("vector")
+            current_dim = vector_field.type.list_size
+
+            if current_dim == target_dim:
+                return  # No migration needed
+
+            logger.warning(
+                "Vector dimension mismatch: table=%d, embedder=%d. "
+                "Re-embedding all %d entries...",
+                current_dim, target_dim, table.count_rows()
+            )
+
+            # Read all existing data
+            all_rows = []
+            arrow_table = table.to_arrow()
+            for i in range(len(arrow_table)):
+                row = {
+                    "id": arrow_table.column("id")[i].as_py(),
+                    "text": arrow_table.column("text")[i].as_py(),
+                    "category": arrow_table.column("category")[i].as_py(),
+                    "scope": arrow_table.column("scope")[i].as_py(),
+                    "importance": arrow_table.column("importance")[i].as_py(),
+                    "timestamp": arrow_table.column("timestamp")[i].as_py(),
+                    "metadata": arrow_table.column("metadata")[i].as_py(),
+                }
+                all_rows.append(row)
+
+            # Re-embed with new model (use CPU for migration to avoid MPS memory issues)
+            if self._embedder is None:
+                logger.error("Cannot migrate: no embedder available")
+                return
+
+            texts = [r["text"] for r in all_rows]
+            logger.info("Re-embedding %d entries with %sd model...", len(texts), target_dim)
+
+            # Force CPU for migration to avoid MPS memory limits on large batches
+            migrate_device = "cpu"
+            try:
+                # If using sentence-transformers, temporarily switch device
+                if hasattr(self._embedder, '_model') and self._embedder._model is not None:
+                    self._embedder._model = self._embedder._model.to(migrate_device)
+            except Exception:
+                pass
+
+            # Small batches to avoid memory spikes
+            batch_size = 8
+            new_vectors = []
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i:i + batch_size]
+                vecs = self._embedder.embed_batch(batch)
+                new_vectors.extend(vecs)
+                if (i // batch_size + 1) % 10 == 0:
+                    logger.info("Re-embedded %d/%d entries...", i + len(batch), len(texts))
+
+            # Restore original device after migration
+            try:
+                if hasattr(self._embedder, '_model') and self._embedder._model is not None:
+                    self._embedder._model = self._embedder._model.to(self._embedder.device)
+            except Exception:
+                pass
+
+            # Drop old table and create new one
+            db.drop_table("memories")
+            logger.info("Old table dropped. Creating new table with %sd vectors...", target_dim)
+
+            # Re-import data in batches to avoid memory spike
+            batch_size = 50
+            new_table = None
+            for i in range(0, len(all_rows), batch_size):
+                batch_rows = all_rows[i:i + batch_size]
+                batch_vectors = new_vectors[i:i + batch_size]
+                batch_data = [
+                    {
+                        "id": r["id"],
+                        "text": r["text"],
+                        "vector": v,
+                        "category": r["category"],
+                        "scope": r["scope"],
+                        "importance": r["importance"],
+                        "timestamp": r["timestamp"],
+                        "metadata": r["metadata"],
+                    }
+                    for r, v in zip(batch_rows, batch_vectors)
+                ]
+                if new_table is None:
+                    new_table = db.create_table("memories", data=batch_data)
+                else:
+                    new_table.add(batch_data)
+                logger.debug("Migrated batch %d/%d (%d rows)",
+                             i // batch_size + 1,
+                             (len(all_rows) + batch_size - 1) // batch_size,
+                             len(batch_data))
+
+            logger.info("Migration complete: %d entries re-embedded to %sd", len(all_rows), target_dim)
+
+        except Exception as e:
+            logger.error("Migration failed: %s", e)
+            # Don't raise — let initialization continue with fresh table
+
+    def _verify_and_recover_lancedb(self, lance_path: Path) -> None:
+        """Verify LanceDB integrity and auto-recover from corruption.
+        
+        This is the ROOT CAUSE FIX for the previous corruption issue where
+        the manifest referenced missing physical data files.
+        
+        CRITICAL: restore() creates a new version, so we must avoid concurrent
+        writes during recovery. Call this BEFORE starting WAL batchers.
+        """
+        try:
+            import lancedb
+            db = lancedb.connect(str(lance_path))
+            if "memories" not in _get_table_names(db):
+                return  # Fresh database, nothing to verify
+            
+            table = db.open_table("memories")
+            
+            # Test 1: Can we count rows?
+            try:
+                count = table.count_rows()
+                logger.info("LanceDB integrity check: count=%d OK", count)
+            except Exception as e:
+                logger.error("LanceDB integrity check FAILED (count): %s", e)
+                self._attempt_lancedb_recovery(lance_path)
+                return
+            
+            # Test 2: Can we read data via arrow scan?
+            try:
+                arrow = table.to_arrow()
+                logger.info("LanceDB integrity check: arrow scan OK (%d rows)", len(arrow))
+            except Exception as e:
+                logger.error("LanceDB integrity check FAILED (arrow scan): %s", e)
+                self._attempt_lancedb_recovery(lance_path)
+                return
+            
+            # Test 3: Can we search? (skip if numpy unavailable — not a corruption sign)
+            try:
+                import numpy as np
+                has_numpy = True
+            except ImportError:
+                has_numpy = False
+            if has_numpy:
+                try:
+                    test_vec = np.zeros(table.schema.field("vector").type.list_size, dtype=np.float32)
+                    results = table.search(test_vec, vector_column_name="vector").limit(1).to_list()
+                    logger.info("LanceDB integrity check: vector search OK")
+                except Exception as e:
+                    logger.error("LanceDB integrity check FAILED (vector search): %s", e)
+                    self._attempt_lancedb_recovery(lance_path)
+                    return
+                
+        except Exception as e:
+            logger.error("LanceDB integrity check FAILED: %s", e)
+            self._attempt_lancedb_recovery(lance_path)
+    
+    def _attempt_lancedb_recovery(self, lance_path: Path) -> None:
+        """Attempt to recover LanceDB from the last working version.
+        
+        COMPAT: Handles both dict-style and object-style version entries
+        from different LanceDB API versions.
+        
+        CRITICAL FIX: After recovery, we must update BOTH self._storage AND
+        self._retriever.storage, otherwise the retriever holds a stale reference
+        to the corrupted table and search will continue to fail.
+        """
+        try:
+            import lancedb
+            db = lancedb.connect(str(lance_path))
+            table = db.open_table("memories")
+            
+            # Get version history
+            try:
+                versions = table.list_versions()
+            except Exception as e:
+                logger.error("list_versions() not available or failed: %s", e)
+                return
+            
+            if not versions:
+                logger.error("No versions available for recovery")
+                return
+            
+            # Extract version numbers with robust type handling
+            version_numbers = []
+            for v in versions:
+                ver_num = None
+                if isinstance(v, dict):
+                    ver_num = v.get('version') or v.get('V') or v.get('version_number')
+                elif hasattr(v, 'version'):
+                    ver_num = v.version
+                elif hasattr(v, 'V'):
+                    ver_num = v.V
+                elif hasattr(v, '__int__'):
+                    ver_num = int(v)
+                if ver_num is not None:
+                    try:
+                        version_numbers.append(int(ver_num))
+                    except (TypeError, ValueError):
+                        pass
+            
+            if not version_numbers:
+                logger.error("Could not extract version numbers from list_versions()")
+                return
+            
+            # Try versions from newest to oldest
+            for ver_num in reversed(version_numbers):
+                try:
+                    table.restore(ver_num)
+                    # Verify the restored version works
+                    count = table.count_rows()
+                    arrow = table.to_arrow()
+                    logger.warning(
+                        "LanceDB RECOVERED from version %d: %d rows, %d cols",
+                        ver_num, count, len(arrow.column_names)
+                    )
+                    # CRITICAL FIX: Update storage reference AND retriever reference
+                    new_storage = LanceDBStorage(
+                        db_path=str(lance_path),
+                        vector_dim=self._storage.vector_dim if self._storage else 384,
+                    )
+                    self._storage = new_storage
+                    if self._retriever is not None:
+                        self._retriever.storage = new_storage
+                    return
+                except Exception as e:
+                    logger.debug("Recovery from version %d failed: %s", ver_num, e)
+                    continue
+            
+            logger.error("All recovery attempts failed. LanceDB may need manual rebuild.")
+            
+        except Exception as e:
+            logger.error("LanceDB recovery failed: %s", e)
+
+    def _run_maintenance(self) -> None:
+        """Periodic maintenance: compact storage and cleanup stale memories.
+
+        OPTIMIZATION: Scans a sample of memories (up to 500) and deletes
+        those whose decay composite score has fallen below the stale threshold.
+        Also triggers LanceDB compaction to reclaim storage space.
+        """
+        if not self._initialized or self._storage is None:
+            return
+        try:
+            # Step 1: Compact LanceDB (reclaim storage from old versions)
+            self._storage._compact_table()
+        except Exception as e:
+            logger.debug("Maintenance compaction failed: %s", e)
+
+        # Step 2: Cleanup stale memories
+        if self._decay_engine is None:
+            return
+        try:
+            # Sample up to 500 memories for decay scoring
+            sample = self._storage._get_table().search().limit(500).to_list()
+            if not sample:
+                return
+
+            decayables = []
+            for row in sample:
+                try:
+                    entry = MemoryEntry.from_row(row)
+                    dm = DecayableMemory(
+                        id=entry.id,
+                        importance=entry.importance,
+                        confidence=entry.confidence,
+                        tier=MemoryTier(entry.tier),
+                        accessCount=entry.access_count,
+                        createdAt=entry.created_at if entry.created_at else int(entry.timestamp * 1000),
+                        lastAccessedAt=entry.last_accessed_at if entry.last_accessed_at else int(entry.timestamp * 1000),
+                        temporalType=entry.temporal_type,
+                    )
+                    decayables.append(dm)
+                except Exception:
+                    continue
+
+            stale_scores = self._decay_engine.get_stale_memories(decayables)
+            deleted = 0
+            for score in stale_scores:
+                try:
+                    self._storage.delete(score.memoryId)
+                    deleted += 1
+                except Exception:
+                    continue
+
+            if deleted:
+                logger.info("Maintenance: deleted %d stale memories", deleted)
+        except Exception as e:
+            logger.debug("Maintenance stale cleanup failed: %s", e)
+
+    def shutdown(self) -> None:
+        """关闭所有组件"""
+        if self._wal is not None:
+            try:
+                self._wal.flush()
+            except Exception:
+                pass
+        if self._access_tracker is not None:
+            try:
+                self._access_tracker.flush()
+            except Exception:
+                pass  # Ignore flush errors during shutdown
+        # Stop background extraction thread
+        try:
+            from .smart_extractor import stop_extraction
+            stop_extraction()
+        except Exception:
+            pass
+        # CRITICAL FIX: Shut down HybridRetriever's ThreadPoolExecutor to
+        # prevent thread leak on every provider restart.
+        if self._retriever is not None:
+            try:
+                self._retriever.close()
+            except Exception:
+                pass
+        self._initialized = False
+        logger.info("HermesMemoryProvider shutdown")
+
+    # =============================================================================
+    # Core Memory Operations
+    # =============================================================================
+
+    def search(
+        self,
+        query: str,
+        limit: int = 10,
+        scope: str = "global",
+        category: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        # Defensive: ensure limit is an int (JSON deserialization may return str)
+        limit = int(limit)
+        """
+        混合检索: Vector + BM25 + RRF + Rerank + Decay
+
+        OPTIMIZATION: Results are cached for 5 minutes to avoid redundant
+        vector searches for identical queries.
+        """
+        if not self._initialized:
+            return []
+
+        # OPTIMIZATION: Query result cache — check for recent identical query
+        cache_key = f"{query!r}:{limit}:{scope}:{category}"
+        now = time.time()
+        with self._query_cache_lock:
+            cached = self._query_cache.get(cache_key)
+            if cached is not None:
+                cached_at, results = cached
+                if now - cached_at < self._query_cache_ttl:
+                    logger.debug("Query cache hit for '%s...'", query[:30])
+                    return results
+                else:
+                    # Expired — remove it
+                    self._query_cache.pop(cache_key, None)
+
+        # OPTIMIZATION: Adaptive retrieval — skip embedding/API calls for
+        # greetings, commands, and other queries that clearly don't need
+        # long-term memory. This saves significant compute on every turn.
+        # Only skip when we have an embedder (the expensive part); BM25-only
+        # mode is cheap enough that we always run it.
+        if self._retriever is not None and self._retriever.embedder is not None:
+            from .adaptive_retrieval import should_skip_retrieval
+            if should_skip_retrieval(query):
+                logger.debug("Adaptive retrieval: skipped for query '%s...'", query[:30])
+                # Cache the empty result too — avoids re-evaluating on repeats
+                with self._query_cache_lock:
+                    self._query_cache[cache_key] = (time.time(), [])
+                    if len(self._query_cache) > self._query_cache_max_size:
+                        oldest_key = next(iter(self._query_cache))
+                        self._query_cache.pop(oldest_key, None)
+                return []
+
+        # Scope guard
+        with ScopeGuard(scope):
+            # Full retrieval pipeline — skip vector search if embedder unavailable
+            if self._retriever is None or self._retriever.embedder is None:
+                # BM25-only fallback when no embedding API available
+                bm25_results = self._storage.bm25_search(
+                    query=query,
+                    limit=limit * 2,
+                    scope_filter=[scope] if scope != "global" else None,
+                    category=category,
+                    min_score=0.0,
+                )
+                results = [{"entry": r.entry, "score": r.score} for r in bm25_results]
+                diagnostics_data = {"vector_result_count": 0, "bm25_result_count": len(results), "fused_result_count": len(results)}
+            else:
+                retrieve_results, diag = self._retriever.retrieve(
+                    query=query,
+                    limit=limit * 2,  # Fetch more for filtering
+                    scope_filter=[scope] if scope != "global" else None,
+                    category=category,
+                )
+                results = [{"entry": r.entry, "score": r.fused_score} for r in retrieve_results]
+                diagnostics_data = {"vector_result_count": diag.vector_result_count, "bm25_result_count": diag.bm25_result_count, "fused_result_count": diag.fused_result_count}
+
+            # Apply decay — convert MemoryEntry to DecayableMemory for the engine
+            if self._decay_engine is not None and self._retriever is not None and self._retriever.embedder is not None and results:
+                try:
+                    boosted = []
+                    for r in results:
+                        entry = r["entry"]
+                        dm = DecayableMemory(
+                            id=entry.id,
+                            importance=entry.importance,
+                            confidence=entry.confidence,
+                            tier=MemoryTier(entry.tier),
+                            accessCount=entry.access_count,
+                            createdAt=entry.created_at if entry.created_at else int(entry.timestamp * 1000),
+                            lastAccessedAt=entry.last_accessed_at if entry.last_accessed_at else int(entry.timestamp * 1000),
+                            temporalType=entry.temporal_type,
+                        )
+                        boosted.append((dm, r["score"]))
+                    self._decay_engine.apply_search_boost(
+                        boosted,
+                        now=int(time.time() * 1000),
+                    )
+                    # Map decayed scores back to results by index
+                    for i, (_, new_score) in enumerate(boosted):
+                        if i < len(results):
+                            results[i]["score"] = new_score
+                except Exception as e:
+                    logger.debug("DecayEngine.apply_search_boost failed: %s", e)
+
+            # Filter noise
+            results = [r for r in results if not is_noise(r["entry"].text)]
+
+            # Limit results
+            results = results[:limit]
+
+            # Record access
+            if self._access_tracker is not None and results:
+                self._access_tracker.record_access([r["entry"].id for r in results])
+
+            # Format results
+            formatted = [
+                {
+                    "id": r["entry"].id,
+                    "text": r["entry"].text,
+                    "score": r["score"],
+                    "category": r["entry"].category,
+                    "scope": r["entry"].scope,
+                    "importance": r["entry"].importance,
+                    "timestamp": r["entry"].timestamp,
+                    "metadata": r["entry"].metadata,
+                }
+                for r in results
+            ]
+            # Cache the formatted results (with size cap to prevent OOM)
+            with self._query_cache_lock:
+                self._query_cache[cache_key] = (time.time(), formatted)
+                if len(self._query_cache) > self._query_cache_max_size:
+                    # Evict oldest entry (dict preserves insertion order in Python 3.7+)
+                    oldest_key = next(iter(self._query_cache))
+                    self._query_cache.pop(oldest_key, None)
+            return formatted
+
+    def store(
+        self,
+        text: str,
+        category: str = "other",
+        importance: float = 0.5,
+        scope: str = "global",
+        metadata: Optional[Dict[str, Any]] = None,
+        role: str = "user",
+        speaker: str = "user",
+    ) -> Dict[str, Any]:
+        """
+        存储记忆: 写入LanceDB + KG + WAL
+        """
+        if not self._initialized:
+            return {"error": "not initialized"}
+
+        with self._lock:
+            import time
+            import uuid
+
+            # Get vector embedding for the text
+            # CRITICAL FIX: Always use the actual table's vector dimension from schema,
+            # not the cached vector_dim which may be stale or wrong due to migration issues.
+            actual_dim = self._storage.vector_dim if self._storage else 384
+            try:
+                # Verify against actual table schema for extra safety
+                if self._storage is not None:
+                    table = self._storage._get_table()
+                    schema = table.schema
+                    vector_field = schema.field("vector")
+                    schema_dim = int(vector_field.type.list_size)
+                    if schema_dim != actual_dim:
+                        logger.warning(
+                            "Vector dimension mismatch detected: storage=%d, schema=%d. "
+                            "Using schema dimension.", actual_dim, schema_dim
+                        )
+                        actual_dim = schema_dim
+                        self._storage.vector_dim = schema_dim  # Fix the cached value
+            except Exception:
+                pass  # Fallback to cached value
+
+            vector_dim = actual_dim
+            try:
+                if self._embedder:
+                    vector = self._embedder.embed(text)
+                    # Verify embedder output matches expected dimension
+                    if len(vector) != vector_dim:
+                        logger.warning(
+                            "Embedder output dimension mismatch: expected %d, got %d. "
+                            "Padding/truncating.", vector_dim, len(vector)
+                        )
+                        if len(vector) < vector_dim:
+                            vector = vector + [0.0] * (vector_dim - len(vector))
+                        else:
+                            vector = vector[:vector_dim]
+                else:
+                    # Fallback: generate a deterministic pseudo-embedding from text hash
+                    import hashlib
+                    h = hashlib.sha256(text.encode()).digest()
+                    vector = []
+                    seed = text
+                    while len(vector) < vector_dim:
+                        h = hashlib.sha256((seed + str(len(vector))).encode()).digest()
+                        vector.extend([float(v) / 255.0 * 2.0 - 1.0 for v in h])
+                    vector = vector[:vector_dim]
+            except Exception as e:
+                logger.warning("Failed to embed text: %s", e)
+                vector = [0.0] * vector_dim  # Fallback zero vector matching table dim
+
+            # OPTIMIZATION: Deduplication — check for near-duplicate memories
+            # before writing. If a very similar memory exists, update it instead.
+            # Ensure previous buffered writes are visible for dedup search.
+            if self._storage is not None and self._storage.has_pending_writes():
+                self._storage._flush_buffer()
+            duplicate_id = None
+            try:
+                if self._storage and self._storage._fts_index_created:
+                    # Use first 80 chars as BM25 query for similarity probe
+                    probe = text[:80].strip()
+                    if probe:
+                        dup_results = self._storage.bm25_search(
+                            query=probe,
+                            limit=3,
+                            scope_filter=[scope] if scope != "global" else None,
+                            category=category,
+                        )
+                        if dup_results:
+                            import difflib
+                            best_ratio = 0.0
+                            best_id = None
+                            for dr in dup_results:
+                                ratio = difflib.SequenceMatcher(
+                                    None, text, dr.entry.text
+                                ).quick_ratio()
+                                if ratio > best_ratio:
+                                    best_ratio = ratio
+                                    best_id = dr.entry.id
+                            if best_ratio > 0.92:
+                                duplicate_id = best_id
+                                logger.debug(
+                                    "Deduplication: merging into %s (similarity %.2f)",
+                                    duplicate_id[:8], best_ratio,
+                                )
+            except Exception:
+                # Deduplication is best-effort; never block store on failure
+                pass
+
+            if duplicate_id:
+                # Update existing entry: boost importance and refresh updated_at
+                try:
+                    self._storage.update(
+                        duplicate_id,
+                        {
+                            "importance": min(1.0, importance + 0.1),
+                            "updated_at": int(time.time() * 1e9),  # ns timestamp for LanceDB schema
+                        },
+                    )
+                    return {
+                        "id": duplicate_id,
+                        "text": text,
+                        "category": category,
+                        "scope": scope,
+                        "importance": min(1.0, importance + 0.1),
+                        "deduplicated": True,
+                    }
+                except Exception as e:
+                    logger.debug("Deduplication update failed, falling back to insert: %s", e)
+                    # Fall through to normal insert
+
+            # Create a proper MemoryEntry
+            entry = MemoryEntry(
+                id=str(uuid.uuid4()),
+                text=text,
+                vector=vector,
+                category=category,
+                scope=scope,
+                importance=importance,
+                timestamp=time.time(),
+                metadata=json.dumps(metadata or {}),
+            )
+
+            # Write to LanceDB
+            stored = self._storage.store(entry)
+
+            # CRITICAL: Flush buffer immediately to ensure data is persisted
+            # LanceDB uses async buffering - without this flush, data may be lost
+            flush_success = False
+            if self._storage and hasattr(self._storage, '_flush_buffer'):
+                try:
+                    self._storage._flush_buffer()
+                    flush_success = True
+                except Exception as e:
+                    logger.error("CRITICAL: Failed to flush storage buffer: %s", e, exc_info=True)
+
+            # Add to Working Memory (best-effort)
+            if self._working_memory is not None:
+                try:
+                    self._working_memory.add_turn(
+                        role=role,
+                        content=text,
+                        speaker=speaker,
+                        topic=category,
+                        importance=importance,
+                    )
+                except Exception as e:
+                    logger.debug("WorkingMemory add_turn failed: %s", e)
+
+            # Add to WAL (best-effort)
+            if self._wal is not None:
+                try:
+                    self._wal.append(
+                        content=text,
+                        speaker=speaker,
+                        role=role,
+                        topic=category,
+                        importance=importance,
+                        scope=scope,
+                    )
+                except Exception as e:
+                    logger.debug("WAL append failed: %s", e)
+
+            # Extract and store KG triples (best-effort, background)
+            if self._kg is not None:
+                try:
+                    self._extract_and_store_kg(text, stored.id)
+                except Exception as e:
+                    logger.debug("KG extraction failed: %s", e)
+
+            return {
+                "id": stored.id,
+                "text": stored.text,
+                "category": stored.category,
+                "scope": stored.scope,
+                "importance": stored.importance,
+                "flush_success": flush_success,
+            }
+
+    def recall(self, memory_id: str) -> Optional[Dict[str, Any]]:
+        """
+        手动召回单条记忆 (更新access_count)
+        """
+        if not self._initialized:
+            return None
+
+        entry = self._storage.get_by_id(memory_id)
+        if not entry:
+            return None
+
+        # Record access
+        if self._access_tracker:
+            self._access_tracker.record_access([memory_id])
+
+        return {
+            "id": entry.id,
+            "text": entry.text,
+            "category": entry.category,
+            "scope": entry.scope,
+            "importance": entry.importance,
+            "timestamp": entry.timestamp,
+            "metadata": entry.metadata,
+        }
+
+    def forget(self, memory_id: str) -> bool:
+        """
+        删除记忆 (软删除)
+        """
+        if not self._initialized:
+            return False
+
+        return self._storage.delete(memory_id)
+
+    def get_profile(self) -> Dict[str, Any]:
+        """
+        获取用户profile (从KG提取)
+        """
+        if not self._initialized:
+            return {}
+
+        profile = {
+            "facts": [],
+            "preferences": [],
+            "recent": [],
+        }
+
+        if self._kg is None:
+            return profile
+
+        try:
+            # Search KG for user facts - use broader query to catch more results
+            triples = self._kg.search("")  # Empty query returns all
+            
+            for triple in triples[:50]:
+                # Look for user-related triples
+                if any(kw in triple.subject.lower() or kw in triple.object.lower() 
+                       for kw in ["user", "城哥", "preference", "prefers", "likes", "决策", "风格"]):
+                    if triple.predicate in ["prefers", "likes", "owns", "决策模式", "风格"]:
+                        profile["preferences"].append({
+                            "subject": triple.subject,
+                            "predicate": triple.predicate,
+                            "object": triple.object,
+                        })
+                    else:
+                        profile["facts"].append({
+                            "subject": triple.subject,
+                            "predicate": triple.predicate,
+                            "object": triple.object,
+                        })
+                        
+            # Also add recent high-importance memories as "recent"
+            if self._storage:
+                try:
+                    recent = self._storage.bm25_search("", limit=5)
+                    for r in recent:
+                        profile["recent"].append({
+                            "text": r.entry.text[:200],
+                            "category": r.entry.category,
+                            "timestamp": r.entry.timestamp,
+                        })
+                except Exception:
+                    pass
+                    
+        except Exception as e:
+            logger.debug("get_profile KG search failed: %s", e)
+
+        return profile
+
+    def kg_search(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """
+        KG检索
+        """
+        limit = int(limit)
+        if not self._initialized or self._kg is None:
+            return []
+
+        try:
+            triples = self._kg.search(query, limit=limit)
+            return [
+                {
+                    "id": triple.id,
+                    "subject": triple.subject,
+                    "predicate": triple.predicate,
+                    "object": triple.object,
+                    "valid_from": triple.valid_from,
+                    "confidence": triple.confidence,
+                }
+                for triple in triples
+            ]
+        except Exception as e:
+            logger.debug("kg_search failed: %s", e)
+            return []
+
+    def add_triple(
+        self,
+        subject: str,
+        predicate: str,
+        obj: str,
+        confidence: float = 1.0,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """
+        添加KG triple
+        """
+        if not self._initialized:
+            return {"error": "not initialized"}
+
+        try:
+            triple = add_triple_with_entity(
+                subject=subject,
+                predicate=predicate,
+                object=obj,
+                confidence=confidence,
+                **kwargs,
+            )
+            return {
+                "id": triple.id,
+                "subject": triple.subject,
+                "predicate": triple.predicate,
+                "object": triple.object,
+            }
+        except Exception as e:
+            logger.warning("add_triple failed: %s", e)
+            return {"error": str(e)}
+
+    def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
+        """
+        处理Hermes工具调用
+        """
+        if tool_name == "memory_search":
+            results = self.search(
+                query=args.get("query", ""),
+                limit=int(args.get("limit") or 10),
+                scope=args.get("scope", "global"),
+                category=args.get("category"),
+            )
+            return json.dumps(results, ensure_ascii=False, default=str)
+
+        elif tool_name == "memory_store":
+            result = self.store(
+                text=args.get("text", ""),
+                category=args.get("category", "other"),
+                importance=float(args.get("importance") or 0.5),
+                scope=args.get("scope", "global"),
+                metadata=args.get("metadata"),
+            )
+            # Map internal 'id' field to expected 'memory_id'
+            if "id" in result:
+                result["memory_id"] = result.pop("id")
+            return json.dumps(result, ensure_ascii=False, default=str)
+
+        elif tool_name == "memory_recall":
+            result = self.recall(args.get("memory_id", ""))
+            if result and "id" in result:
+                result["memory_id"] = result.pop("id")
+            return json.dumps(result or {}, ensure_ascii=False, default=str)
+
+        elif tool_name == "memory_forget":
+            success = self.forget(args.get("memory_id", ""))
+            return json.dumps({"success": success})
+
+        elif tool_name == "memory_profile":
+            result = self.get_profile()
+            return json.dumps(result, ensure_ascii=False, default=str)
+
+        elif tool_name == "memory_kg_search":
+            results = self.kg_search(
+                query=args.get("query", ""),
+                limit=int(args.get("limit") or 10),
+            )
+            return json.dumps(results, ensure_ascii=False, default=str)
+
+        elif tool_name == "memory_stats":
+            wm_count = 0
+            if self._working_memory is not None:
+                try:
+                    wm_count = len(self._working_memory._turns)
+                except Exception:
+                    wm_count = 0
+            kg_count = 0
+            if self._kg is not None:
+                try:
+                    kg_count = len(self._kg.search("", limit=10000))
+                except Exception:
+                    kg_count = 0
+            return json.dumps({
+                "storage_count": self._storage.count() if self._storage else 0,
+                "working_memory_count": wm_count,
+                "kg_triples": kg_count,
+            })
+
+        return json.dumps({"error": f"Unknown tool: {tool_name}"})
+
+    # =============================================================================
+    # Helper Methods
+    # =============================================================================
+
+    def _extract_and_store_kg(self, text: str, memory_id: str) -> None:
+        """从记忆中提取KG三元组（LLM智能抽取 + 正则降级）。"""
+        if not text or len(text.strip()) < 10:
+            return
+
+        # Queue for background LLM extraction (non-blocking)
+        queue_extraction(text=text, memory_id=memory_id, stored_id=memory_id)
+
+
+# =============================================================================
+# Provider Registry Entry Point
+# =============================================================================
+
+def get_provider() -> HermesMemoryProvider:
+    """获取Provider实例 (供Hermes加载)"""
+    return HermesMemoryProvider()

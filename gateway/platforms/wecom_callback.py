@@ -36,7 +36,7 @@ except ImportError:
     HTTPX_AVAILABLE = False
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult, DEFAULT_HTTPX_LIMITS
 from gateway.platforms.wecom_crypto import WXBizMsgCrypt, WeComCryptoError
 
 logger = logging.getLogger(__name__)
@@ -119,7 +119,7 @@ class WecomCallbackAdapter(BasePlatformAdapter):
             pass
 
         try:
-            self._http_client = httpx.AsyncClient(timeout=20.0)
+            self._http_client = httpx.AsyncClient(timeout=20.0, limits=DEFAULT_HTTPX_LIMITS)
             self._app = web.Application()
             self._app.router.add_get("/health", self._handle_health)
             self._app.router.add_get(self._path, self._handle_verify)

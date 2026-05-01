@@ -223,9 +223,9 @@ _API_KEY_PROVIDER_AUX_MODELS: Dict[str, str] = {
     "stepfun": "step-3.5-flash",
     "kimi-coding-cn": "kimi-k2-turbo-preview",
     "gmi": "google/gemini-3.1-flash-lite-preview",
-    "minimax": "MiniMax-M2.7",
+    "minimax": "MiniMax-M2.7-highspeed",
     "minimax-oauth": "MiniMax-M2.7-highspeed",
-    "minimax-cn": "MiniMax-M2.7",
+    "minimax-cn": "MiniMax-M2.7-highspeed",
     "anthropic": "claude-haiku-4-5-20251001",
     "ai-gateway": "google/gemini-3-flash",
     "opencode-zen": "gemini-3-flash",
@@ -1919,7 +1919,7 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
             is_agent_turn=True, is_vision=is_vision
         )
     elif base_url_host_matches(sync_base_url, "api.kimi.com"):
-        async_kwargs["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
+        async_kwargs["default_headers"] = {"User-Agent": "KimiCLI/1.30.0"}
     return AsyncOpenAI(**async_kwargs), model
 
 
@@ -2141,7 +2141,7 @@ def resolve_provider_client(
             if _dq:
                 extra["default_query"] = _dq
             if base_url_host_matches(custom_base, "api.kimi.com"):
-                extra["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
+                extra["default_headers"] = {"User-Agent": "KimiCLI/1.30.0"}
             elif base_url_host_matches(custom_base, "api.githubcopilot.com"):
                 from hermes_cli.copilot_auth import copilot_request_headers
                 extra["default_headers"] = copilot_request_headers(
@@ -2328,7 +2328,7 @@ def resolve_provider_client(
         # Provider-specific headers
         headers = {}
         if base_url_host_matches(base_url, "api.kimi.com"):
-            headers["User-Agent"] = "claude-code/0.1.0"
+            headers["User-Agent"] = "KimiCLI/1.30.0"
         elif base_url_host_matches(base_url, "api.githubcopilot.com"):
             from hermes_cli.copilot_auth import copilot_request_headers
 
@@ -3221,6 +3221,25 @@ def _build_call_kwargs(
         if _forbids_sampling_params(model):
             temperature = None
 
+    # MiniMax-M2.7-highspeed only accepts temperature=0.6 — silently clamp
+    # any other value to avoid "invalid temperature" 400 errors.
+    _minimax_cn = provider in ("minimax", "minimax-cn")
+    # When provider="auto" the clamp above misses MiniMax because "auto" is not in the list.
+    # Fall back to model-name detection so any caller that uses provider="auto" with a
+    # MiniMax model still gets protected.
+    if not _minimax_cn and temperature is not None and temperature != 0.6:
+        _m = (model or "").lower()
+        if _m == "minimax-m2.7-highspeed":
+            _minimax_cn = True
+    # Also check base_url for MiniMax endpoints (handles provider="auto" case where
+    # the actual endpoint URL contains "minimax" or "api.minimax").
+    if not _minimax_cn and base_url:
+        _bu = base_url.lower()
+        if "minimax" in _bu or "api.minimax" in _bu:
+            _minimax_cn = True
+    if _minimax_cn and temperature != 0.6:
+        temperature = 0.6
+
     if temperature is not None:
         kwargs["temperature"] = temperature
 
@@ -3678,7 +3697,9 @@ async def async_call_llm(
                     f"was found. Set the {_explicit.upper()}_API_KEY environment "
                     f"variable, or switch to a different provider with `hermes model`."
                 )
-            if not resolved_base_url:
+            # Only auto-detect if the provider is "auto" or falsy — NOT when a specific
+            # provider was requested but its client failed (e.g. missing API key).
+            if resolved_provider in ("auto", None, "") or not resolved_base_url:
                 logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
                             task or "call", resolved_provider)
                 client, final_model = _get_cached_client("auto", async_mode=True)

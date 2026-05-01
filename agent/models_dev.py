@@ -221,33 +221,37 @@ def fetch_models_dev(force_refresh: bool = False) -> Dict[str, Any]:
     ):
         return _models_dev_cache
 
-    # Try network fetch
-    try:
-        response = requests.get(MODELS_DEV_URL, timeout=15)
-        response.raise_for_status()
-        data = response.json()
-        if isinstance(data, dict) and data:
-            _models_dev_cache = data
-            _models_dev_cache_time = time.time()
-            _save_disk_cache(data)
-            logger.debug(
-                "Fetched models.dev registry: %d providers, %d total models",
-                len(data),
-                sum(len(p.get("models", {})) for p in data.values() if isinstance(p, dict)),
-            )
-            return data
-    except Exception as e:
-        logger.debug("Failed to fetch models.dev: %s", e)
-
-    # Fall back to disk cache — use a short TTL (5 min) so we retry
-    # the network fetch soon instead of serving stale data for a full hour.
+    # CRITICAL FIX: load disk cache BEFORE attempting a blocking network
+    # request.  On slow/flaky networks the HTTP fetch can take 10-15s and
+    # agent init watchdogs (60s) fire before the model metadata is ready.
+    # Disk cache is sufficient for offline context-length lookups.
     if not _models_dev_cache:
         _models_dev_cache = _load_disk_cache()
         if _models_dev_cache:
             _models_dev_cache_time = time.time() - _MODELS_DEV_CACHE_TTL + 300
             logger.debug("Loaded models.dev from disk cache (%d providers)", len(_models_dev_cache))
 
-    return _models_dev_cache
+    # Only hit the network when BOTH caches are empty or force_refresh is set.
+    # This prevents gateway freezes caused by models.dev latency.
+    if force_refresh or not _models_dev_cache:
+        try:
+            response = requests.get(MODELS_DEV_URL, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            if isinstance(data, dict) and data:
+                _models_dev_cache = data
+                _models_dev_cache_time = time.time()
+                _save_disk_cache(data)
+                logger.debug(
+                    "Fetched models.dev registry: %d providers, %d total models",
+                    len(data),
+                    sum(len(p.get("models", {})) for p in data.values() if isinstance(p, dict)),
+                )
+                return data
+        except Exception as e:
+            logger.debug("Failed to fetch models.dev: %s", e)
+
+    return _models_dev_cache or {}
 
 
 def lookup_models_dev_context(provider: str, model: str) -> Optional[int]:
@@ -328,6 +332,19 @@ def _get_provider_models(provider: str) -> Optional[Dict[str, Any]]:
     mdev_provider_id = PROVIDER_TO_MODELS_DEV.get(provider)
     if not mdev_provider_id:
         return None
+
+    # Hardcoded override for MiniMax providers: the live models.dev catalog
+    # still lists deprecated models (MiniMax-M2, etc.) that are no longer
+    # available on the Anthropic-compat endpoint.  Force the only working
+    # model so that alias resolution and catalog queries are correct.
+    if mdev_provider_id in ("minimax", "minimax-cn"):
+        return {
+            "MiniMax-M2.7-highspeed": {
+                "limit": {"context": 204800, "output": 131072},
+                "tool_call": True,
+                "reasoning": True,
+            }
+        }
 
     data = fetch_models_dev()
     provider_data = data.get(mdev_provider_id)

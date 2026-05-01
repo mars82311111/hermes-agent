@@ -15,6 +15,7 @@ import re
 import socket as _socket
 import subprocess
 import sys
+import time
 import uuid
 from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
@@ -22,6 +23,19 @@ from urllib.parse import urlsplit
 from utils import normalize_proxy_url
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Shared HTTP client limits — prevents connection-storm fd exhaustion
+# when DNS or network is flaky (macOS mDNSResponder bug, etc.)
+# ---------------------------------------------------------------------------
+try:
+    import httpx as _httpx_module
+    DEFAULT_HTTPX_LIMITS = _httpx_module.Limits(
+        max_connections=20,
+        max_keepalive_connections=5,
+    )
+except Exception:
+    DEFAULT_HTTPX_LIMITS = None  # type: ignore[misc]
 
 # Audio file extensions Hermes recognizes for native audio delivery.
 # Kept in sync with tools/send_message_tool.py and cron/scheduler.py via
@@ -580,6 +594,7 @@ async def cache_image_from_url(url: str, ext: str = ".jpg", retries: int = 2) ->
         timeout=30.0,
         follow_redirects=True,
         event_hooks={"response": [_ssrf_redirect_guard]},
+        limits=DEFAULT_HTTPX_LIMITS,
     ) as client:
         for attempt in range(retries + 1):
             try:
@@ -694,6 +709,7 @@ async def cache_audio_from_url(url: str, ext: str = ".ogg", retries: int = 2) ->
         timeout=30.0,
         follow_redirects=True,
         event_hooks={"response": [_ssrf_redirect_guard]},
+        limits=DEFAULT_HTTPX_LIMITS,
     ) as client:
         for attempt in range(retries + 1):
             try:
@@ -1874,8 +1890,9 @@ class BasePlatformAdapter(ABC):
         
         # Extract MEDIA:<path> tags, allowing optional whitespace after the colon
         # and quoted/backticked paths for LLM-formatted outputs.
+        # Supported extensions: images, video, audio, and common document formats.
         media_pattern = re.compile(
-            r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|csv|apk|ipa)(?=[\s`"',;:)\]}]|$)|\S+)[`"']?'''
+            r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|csv|apk|ipa|md|json|xml|tar|gz|log)(?=[\s`"',;:)\]}]|$)|\S+)[`"']?''' 
         )
         for match in media_pattern.finditer(content):
             path = match.group("path").strip()

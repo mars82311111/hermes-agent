@@ -31,6 +31,7 @@ from .constants import (
 )
 from .crypto import decrypt_secret, generate_bind_key
 from .utils import get_api_headers
+from gateway.platforms.base import DEFAULT_HTTPX_LIMITS
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +93,7 @@ def _create_bind_task(timeout: float = ONBOARD_API_TIMEOUT) -> Tuple[str, str]:
     url = f"https://{PORTAL_HOST}{ONBOARD_CREATE_PATH}"
     key = generate_bind_key()
 
-    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+    with httpx.Client(timeout=timeout, follow_redirects=True, limits=DEFAULT_HTTPX_LIMITS) as client:
         resp = client.post(url, json={"key": key}, headers=get_api_headers())
         resp.raise_for_status()
         data = resp.json()
@@ -124,7 +125,7 @@ def _poll_bind_result(
 
     url = f"https://{PORTAL_HOST}{ONBOARD_POLL_PATH}"
 
-    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+    with httpx.Client(timeout=timeout, follow_redirects=True, limits=DEFAULT_HTTPX_LIMITS) as client:
         resp = client.post(url, json={"task_id": task_id}, headers=get_api_headers())
         resp.raise_for_status()
         data = resp.json()

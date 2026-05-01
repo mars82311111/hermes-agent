@@ -896,11 +896,11 @@ DEFAULT_CONFIG = {
     },
 
     # Persistent memory -- bounded curated memory injected into system prompt
-    "memory": {
+        "memory": {
         "memory_enabled": True,
         "user_profile_enabled": True,
-        "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
-        "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
+        "memory_char_limit": 5000,   # ~1800 tokens at 2.75 chars/token
+        "user_char_limit": 2000,     # ~700 tokens at 2.75 chars/token
         # External memory provider plugin (empty = built-in only).
         # Set to a provider name to activate: "openviking", "mem0",
         # "hindsight", "holographic", "retaindb", "byterover".

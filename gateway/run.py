@@ -191,6 +191,10 @@ def _last_transcript_timestamp(history: Optional[List[Dict[str, Any]]]) -> Any:
     return None
 
 
+# --- Feishu Scroll Card state ------------------------------------------------
+# Tracks scroll card_id per session_key for automatic scroll card integration
+_SROLL_CARD_IDS: Dict[str, str] = {}  # session_key -> card_id
+
 # ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
 # Must run BEFORE any HTTP library (discord, aiohttp, etc.) is imported.
@@ -4860,6 +4864,12 @@ class GatewayRunner:
         if canonical == "model":
             return await self._handle_model_command(event)
 
+        if canonical == "think":
+            return await self._handle_think_command(event)
+
+        if canonical == "provider":
+            return await self._handle_provider_command(event)
+        
         if canonical == "personality":
             return await self._handle_personality_command(event)
 
@@ -5352,7 +5362,10 @@ class GatewayRunner:
             self._set_session_reasoning_override(session_key, None)
             if hasattr(self, "_pending_model_notes"):
                 self._pending_model_notes.pop(session_key, None)
-        
+
+        # Auto-route message to appropriate model based on complexity
+        self._route_message_to_model(event.text or "", session_key)
+
         # Emit session:start for new or auto-reset sessions
         _is_new_session = (
             session_entry.created_at == session_entry.updated_at
@@ -6229,6 +6242,84 @@ class GatewayRunner:
             _already_sent = bool(agent_result.get("already_sent"))
             if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
                 await self._send_voice_reply(event, response)
+
+            # Auto-finish or auto-fail scroll cards for Feishu when agent completes.
+            # This ensures scroll cards don't stay stuck in "running" status forever.
+            if source.platform == Platform.FEISHU:
+                import sys
+                sys.path.insert(0, '/Users/mars/.hermes/scripts')
+                try:
+                    from feishu_scroll_card import auto_finish_card_async, scroll_card_manager
+                    from gateway.config import load_gateway_config
+                    
+                    # Get the card_id for this session before handling
+                    _card_id_to_handle = _SROLL_CARD_IDS.get(session_key)
+
+                    if not agent_result.get("failed"):
+                        # Success: auto_finish_card handles pending→running→success
+                        _feishu_adapter = self.adapters.get(source.platform)
+                        
+                        # If adapter is None, create a temporary one
+                        if _feishu_adapter is None:
+                            logger.warning("[ScrollCard] Feishu adapter is None, creating temporary adapter")
+                            config = load_gateway_config()
+                            pconfig = config.platforms.get(Platform.FEISHU)
+                            if pconfig:
+                                from gateway.platforms.feishu import FeishuAdapter
+                                _feishu_adapter = FeishuAdapter(pconfig)
+                                domain_name = getattr(_feishu_adapter, "_domain_name", "feishu")
+                                from gateway.platforms.feishu import FEISHU_DOMAIN, LARK_DOMAIN
+                                domain = FEISHU_DOMAIN if domain_name != "lark" else LARK_DOMAIN
+                                _feishu_adapter._client = _feishu_adapter._build_lark_client(domain)
+                        
+                        _result = await auto_finish_card_async(source.chat_id, "任务已完成", adapter=_feishu_adapter)
+                        logger.info(f"[ScrollCard] auto_finish_card_async result: {_result}")
+                    else:
+                        # Failure: use auto_finish_card_async with fail status
+                        _feishu_adapter = self.adapters.get(source.platform)
+                        if _feishu_adapter is None:
+                            logger.warning("[ScrollCard] Feishu adapter is None for failure path, creating temporary adapter")
+                            config = load_gateway_config()
+                            pconfig = config.platforms.get(Platform.FEISHU)
+                            if pconfig:
+                                from gateway.platforms.feishu import FeishuAdapter
+                                _feishu_adapter = FeishuAdapter(pconfig)
+                                domain_name = getattr(_feishu_adapter, "_domain_name", "feishu")
+                                from gateway.platforms.feishu import FEISHU_DOMAIN, LARK_DOMAIN
+                                domain = FEISHU_DOMAIN if domain_name != "lark" else LARK_DOMAIN
+                                _feishu_adapter._client = _feishu_adapter._build_lark_client(domain)
+                        
+                        # Find the card to fail
+                        _fail_card_id = _card_id_to_handle
+                        if not _fail_card_id:
+                            scroll_card_manager._reload_state()
+                            for _cid, _cstate in scroll_card_manager._cards.items():
+                                if _cstate.get("chat_id") == source.chat_id and _cstate.get("status") in ("running", "pending"):
+                                    _fail_card_id = _cid
+                                    break
+                        
+                        if _fail_card_id:
+                            scroll_card_manager.fail_card(_fail_card_id, "任务失败")
+                            _payload = scroll_card_manager.build_update_payload(_fail_card_id, finalize=True)
+                            if _payload and _payload.get("message_id") and _feishu_adapter:
+                                try:
+                                    _card = _payload["card"]
+                                    _card["header"]["template"] = "red"
+                                    _result = await _feishu_adapter.update_card(_payload["message_id"], _card)
+                                    logger.info(f"[ScrollCard] Failed card update result: {_result.success}")
+                                except Exception as _e2:
+                                    logger.warning(f"[ScrollCard] Failed to update failed card: {_e2}")
+                            scroll_card_manager.cleanup(_fail_card_id)
+                            logger.info(f"[ScrollCard] Failed and cleaned up card {_fail_card_id}")
+
+                    # Clean up _SROLL_CARD_IDS entry for this session
+                    if _card_id_to_handle and _card_id_to_handle in _SROLL_CARD_IDS.values():
+                        for _sk, _cid in list(_SROLL_CARD_IDS.items()):
+                            if _cid == _card_id_to_handle:
+                                del _SROLL_CARD_IDS[_sk]
+                                break
+                except Exception as _e:
+                    logger.error(f"[ScrollCard] Error in auto-finish scroll card: {_e}", exc_info=True)
 
             # If streaming already delivered the response, extract and
             # deliver any MEDIA: files before returning None.  Streaming
@@ -7370,6 +7461,185 @@ class GatewayRunner:
 
         return "\n".join(lines)
 
+    async def _handle_think_command(self, event: MessageEvent) -> str:
+        """Handle /think command — switch to Kimi kimi-for-coding for deep thinking.
+
+        Usage:
+            /think              — switch to Kimi kimi-for-coding for this session
+            /think --global     — switch and persist to config.yaml
+        """
+        import yaml
+        from hermes_cli.model_switch import (
+            switch_model as _switch_model,
+        )
+
+        raw_args = event.get_command_args().strip().lower()
+        persist_global = "--global" in raw_args
+
+        # Target: Kimi kimi-for-coding
+        source = event.source
+        session_key = self._session_key_for_source(source)
+
+        # Get current config
+        current_model = ""
+        current_provider = "openrouter"
+        current_base_url = ""
+        current_api_key = ""
+        config_path = _hermes_home / "config.yaml"
+        try:
+            if config_path.exists():
+                with open(config_path, encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f) or {}
+                    model_cfg = cfg.get("model", {})
+                    if isinstance(model_cfg, dict):
+                        current_model = model_cfg.get("default", "")
+                        current_provider = model_cfg.get("provider", current_provider)
+                        current_base_url = model_cfg.get("base_url", "")
+        except Exception:
+            pass
+
+        # Check for session override
+        override = self._session_model_overrides.get(session_key, {})
+        if override:
+            current_model = override.get("model", current_model)
+            current_provider = override.get("provider", current_provider)
+            current_base_url = override.get("base_url", current_base_url)
+            current_api_key = override.get("api_key", current_api_key)
+
+        # Switch to kimi-for-coding on kimi-coding-cn provider
+        result = _switch_model(
+            raw_input="kimi-for-coding",
+            current_provider=current_provider,
+            current_model=current_model,
+            current_base_url=current_base_url,
+            current_api_key=current_api_key,
+            is_global=False,
+            explicit_provider="kimi-coding-cn",
+        )
+
+        if not result.success:
+            return f"Error: {result.error_message}"
+
+        # Update cached agent if exists
+        cached_entry = None
+        _cache_lock = getattr(self, "_agent_cache_lock", None)
+        _cache = getattr(self, "_agent_cache", None)
+        if _cache_lock and _cache is not None:
+            with _cache_lock:
+                cached_entry = _cache.get(session_key)
+
+        if cached_entry and cached_entry[0] is not None:
+            try:
+                cached_entry[0].switch_model(
+                    new_model=result.new_model,
+                    new_provider=result.target_provider,
+                    api_key=result.api_key,
+                    base_url=result.base_url,
+                    api_mode=result.api_mode,
+                )
+            except Exception as exc:
+                logger.warning("In-place model switch failed for cached agent: %s", exc)
+
+        # Store session override
+        self._session_model_overrides[session_key] = {
+            "model": result.new_model,
+            "provider": result.target_provider,
+            "api_key": result.api_key,
+            "base_url": result.base_url,
+            "api_mode": result.api_mode,
+        }
+
+        # Evict cached agent
+        self._evict_cached_agent(session_key)
+
+        # Persist to config if --global
+        if persist_global:
+            try:
+                if config_path.exists():
+                    with open(config_path, encoding="utf-8") as f:
+                        cfg = yaml.safe_load(f) or {}
+                else:
+                    cfg = {}
+                model_cfg = cfg.setdefault("model", {})
+                model_cfg["default"] = result.new_model
+                model_cfg["provider"] = result.target_provider
+                if result.base_url:
+                    model_cfg["base_url"] = result.base_url
+                from hermes_cli.config import save_config
+                save_config(cfg)
+            except Exception as e:
+                logger.warning("Failed to persist /think switch: %s", e)
+
+        lines = [
+            "🧠 Switched to **Kimi kimi-for-coding** (deep thinking mode)",
+            f"Model: `{result.new_model}`",
+            f"Provider: {result.provider_label or result.target_provider}",
+            "_Use `/model <name>` to switch back to another model_",
+        ]
+        if persist_global:
+            lines.append("Saved to config.yaml (`--global`)")
+        else:
+            lines.append("_(session only — add `--global` to persist)_")
+
+        return "\n".join(lines)
+
+    async def _handle_provider_command(self, event: MessageEvent) -> str:
+        """Handle /provider command - show available providers."""
+        import yaml
+        from hermes_cli.models import (
+            list_available_providers,
+            normalize_provider,
+            _PROVIDER_LABELS,
+        )
+
+        # Resolve current provider from config
+        current_provider = "openrouter"
+        model_cfg = {}
+        config_path = _hermes_home / 'config.yaml'
+        try:
+            if config_path.exists():
+                with open(config_path, encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f) or {}
+                model_cfg = cfg.get("model", {})
+                if isinstance(model_cfg, dict):
+                    current_provider = model_cfg.get("provider", current_provider)
+        except Exception:
+            pass
+
+        current_provider = normalize_provider(current_provider)
+        if current_provider == "auto":
+            try:
+                from hermes_cli.auth import resolve_provider as _resolve_provider
+                current_provider = _resolve_provider(current_provider)
+            except Exception:
+                current_provider = "openrouter"
+
+        # Detect custom endpoint from config base_url
+        if current_provider == "openrouter":
+            _cfg_base = model_cfg.get("base_url", "") if isinstance(model_cfg, dict) else ""
+            if _cfg_base and "openrouter.ai" not in _cfg_base:
+                current_provider = "custom"
+
+        current_label = _PROVIDER_LABELS.get(current_provider, current_provider)
+
+        lines = [
+            f"🔌 **Current provider:** {current_label} (`{current_provider}`)",
+            "",
+            "**Available providers:**",
+        ]
+
+        providers = list_available_providers()
+        for p in providers:
+            marker = " ← active" if p["id"] == current_provider else ""
+            auth = "✅" if p["authenticated"] else "❌"
+            aliases = f"  _(also: {', '.join(p['aliases'])})_" if p["aliases"] else ""
+            lines.append(f"{auth} `{p['id']}` — {p['label']}{aliases}{marker}")
+
+        lines.append("")
+        lines.append("Switch: `/model provider:model-name`")
+        lines.append("Setup: `hermes setup`")
+        return "\n".join(lines)
+    
     async def _handle_personality_command(self, event: MessageEvent) -> str:
         """Handle /personality command - list or set a personality."""
         from hermes_constants import display_hermes_home
@@ -10792,10 +11062,28 @@ class GatewayRunner:
         if not override:
             return model, runtime_kwargs
         model = override.get("model", model)
+        overridden_provider = None
         for key in ("provider", "api_key", "base_url", "api_mode"):
             val = override.get(key)
             if val is not None:
                 runtime_kwargs[key] = val
+                if key == "provider":
+                    overridden_provider = val
+        # Defensive: if provider was overridden but base_url/api_key were not
+        # explicitly set in the override, resolve them from the provider config
+        # to avoid sending the wrong model/credentials to the wrong endpoint.
+        if overridden_provider is not None:
+            cfg = _load_gateway_config()
+            providers = cfg.get("providers", {})
+            provider_cfg = providers.get(overridden_provider, {})
+            if override.get("base_url") is None:
+                resolved_base_url = provider_cfg.get("base_url")
+                if resolved_base_url:
+                    runtime_kwargs["base_url"] = resolved_base_url
+            if override.get("api_key") is None:
+                resolved_api_key = provider_cfg.get("api_key")
+                if resolved_api_key:
+                    runtime_kwargs["api_key"] = resolved_api_key
         return model, runtime_kwargs
 
     def _is_intentional_model_switch(self, session_key: str, agent_model: str) -> bool:
@@ -10974,6 +11262,72 @@ class GatewayRunner:
             agent._last_activity_ts = time.time()
             agent._last_activity_desc = "starting new turn (cached)"
         agent._api_call_count = 0
+
+    # -------------------------------------------------------------------------
+    # Auto model routing based on message complexity
+    # -------------------------------------------------------------------------
+
+    COMPLEX_KEYWORDS = [
+        # Chinese
+        '分析', '代码', '调试', 'debug', '实现', '算法', '架构',
+        '优化', '推理', '研究', '深入', '解释', '理解', '设计',
+        '对比', '比较', '研究', '复杂',
+        # English
+        'analyze', 'code', 'debug', 'implement', 'algorithm', 'architecture',
+        'optimize', 'reasoning', 'research', 'complex', 'difficult',
+        'explain', 'understand', 'design', 'compare', 'evaluate',
+        # Code patterns
+        'function', 'class', 'module', 'import', 'api', 'http',
+        'error', 'exception', 'test', 'refactor',
+    ]
+
+    def _analyze_message_complexity(self, message: str) -> bool:
+        """Returns True if message is complex and should use Kimi."""
+        if not message:
+            return False
+        # Length-based heuristic: > 200 chars suggests complexity
+        if len(message) > 200:
+            return True
+        # Check for complex keywords
+        text_lower = message.lower()
+        for keyword in self.COMPLEX_KEYWORDS:
+            if keyword in text_lower:
+                return True
+        return False
+
+    def _route_message_to_model(self, message: str, session_key: str) -> None:
+        """Route message to appropriate model based on complexity analysis.
+
+        Complex messages -> Kimi (for deep reasoning)
+        Simple messages  -> MiniMax (default, fast)
+
+        Once a session routes to Kimi, it stays on Kimi for continuity.
+
+        Controlled by config `model.auto_routing` (default: false).
+        """
+        if not session_key:
+            return
+        # Check if auto-routing is enabled in config
+        try:
+            from hermes_cli.config import load_config
+            cfg = load_config()
+            if not cfg.get("model", {}).get("auto_routing", False):
+                return
+        except Exception:
+            return  # Fail-safe: disable routing if config can't be read
+        current_override = self._session_model_overrides.get(session_key, {})
+        # If session already has a non-default model, preserve it
+        if current_override.get('model') and current_override.get('model') != 'MiniMax-M2.7-highspeed':
+            return
+        is_complex = self._analyze_message_complexity(message)
+        if is_complex:
+            self._session_model_overrides[session_key] = {
+                'model': 'kimi-for-coding',
+                'provider': 'kimi-coding-cn',
+                'base_url': 'https://api.kimi.com/coding/v1',
+            }
+        elif session_key in self._session_model_overrides:
+            del self._session_model_overrides[session_key]
 
     def _release_evicted_agent_soft(self, agent: Any) -> None:
         """Soft cleanup for cache-evicted agents — preserves session tool state.
@@ -11548,7 +11902,7 @@ class GatewayRunner:
 
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
-            if not progress_queue or not _run_still_current():
+            if not _run_still_current():
                 return
 
             # First-touch onboarding: the first time a tool takes longer than
@@ -11600,6 +11954,87 @@ class GatewayRunner:
                     return
             except Exception:
                 pass
+
+            # --- Feishu Scroll Card integration ---
+            # Check if Feishu with scroll mode enabled
+            _feishu_scroll_enabled = (
+                source.platform == Platform.FEISHU
+                and os.getenv("HERMES_FEISHU_SCROLL_MODE", "true").lower() in ("true", "1", "yes")
+            )
+            if _feishu_scroll_enabled:
+                # Import here to avoid circular imports and lazy loading
+                try:
+                    import sys as _sys
+                    _sys.path.insert(0, '/Users/mars/.hermes/scripts')
+                    from feishu_scroll_card import scroll_card_manager
+                    _scroll_mgr = scroll_card_manager
+                except Exception:
+                    _feishu_scroll_enabled = False  # Fall back to normal progress
+
+            if _feishu_scroll_enabled:
+                # Build step info
+                from agent.display import get_tool_emoji
+                _emoji = get_tool_emoji(tool_name, default="⚙️")
+                _step_name = f"{_emoji} {tool_name}"
+                _result = f'"{preview}"' if preview else ""
+
+                # Check if we already have a card for this session
+                _card_id = _SROLL_CARD_IDS.get(session_key)
+                if _card_id is None:
+                    # First tool: create card (pending → running) and append first step
+                    _title = "🔄 任务执行中"
+                    _card_id = _scroll_mgr.init_card(_title, "", source.chat_id, status="pending")
+                    if _card_id:
+                        _SROLL_CARD_IDS[session_key] = _card_id
+                        # Transition from pending → running immediately
+                        _scroll_mgr.start_card(_card_id)
+                        # Append first step
+                        _scroll_mgr.append_step(_card_id, _step_name, _result, status="done")
+                        
+                        # Send initial card to Feishu (use _loop_for_step which is the main gateway loop)
+                        try:
+                            _payload = _scroll_mgr.build_update_payload(_card_id)
+                            if _payload:
+                                _adapter = self.adapters.get(source.platform)
+                                if _adapter and _loop_for_step:
+                                    import asyncio
+                                    _future = asyncio.run_coroutine_threadsafe(
+                                        _adapter.send_card(source.chat_id, _payload["card"]),
+                                        _loop_for_step
+                                    )
+                                    _send_result = _future.result(timeout=30)
+                                    if _send_result.success and _send_result.message_id:
+                                        _scroll_mgr.set_message_id(_card_id, _send_result.message_id)
+                        except Exception as _e:
+                            logger.debug("[ScrollCard] Failed to send initial card: %s", _e)
+                else:
+                    # Subsequent tools: append step
+                    _scroll_mgr.append_step(_card_id, _step_name, _result, status="done")
+                    
+                    # Update existing card (use _loop_for_step which is the main gateway loop)
+                    try:
+                        _payload = _scroll_mgr.build_update_payload(_card_id)
+                        if _payload and _payload.get("message_id"):
+                            _adapter = self.adapters.get(source.platform)
+                            if _adapter and _loop_for_step:
+                                import asyncio
+                                _card_json = json.dumps(_payload["card"], ensure_ascii=False)
+                                from lark_oapi.api.im.v1 import PatchMessageRequest, PatchMessageRequestBody
+                                _request = PatchMessageRequest.builder()                                     .message_id(_payload["message_id"])                                     .request_body(PatchMessageRequestBody.builder()
+                                        .content(_card_json)
+                                        .build())                                     .build()
+                                _future = asyncio.run_coroutine_threadsafe(
+                                    asyncio.to_thread(_adapter._client.im.v1.message.patch, _request),
+                                    _loop_for_step
+                                )
+                                _future.result(timeout=30)
+                    except Exception as _e:
+                        logger.debug("[ScrollCard] Failed to update card: %s", _e)
+                return  # Don't use progress_queue for Feishu scroll mode
+            # --- End Feishu Scroll Card integration ---
+
+            if not progress_queue:
+                return
 
             # "new" mode: only report when tool changes
             if progress_mode == "new" and tool_name == last_tool[0]:
@@ -11671,6 +12106,14 @@ class GatewayRunner:
         _progress_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
 
         async def send_progress_messages():
+            # Skip Feishu when using scroll cards (handled by progress_callback directly)
+            _skip_feishu_scroll = (
+                source.platform == Platform.FEISHU
+                and os.getenv("HERMES_FEISHU_SCROLL_MODE", "true").lower() in ("true", "1", "yes")
+            )
+            if _skip_feishu_scroll:
+                return
+
             if not progress_queue:
                 return
 
@@ -11694,6 +12137,14 @@ class GatewayRunner:
             can_edit = True          # False once an edit fails (platform doesn't support it)
             _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
             _PROGRESS_EDIT_INTERVAL = 1.5  # Minimum seconds between edits
+            _scroll_status = "🔄 进行中"  # Status header: pending/running/success/failed
+            _MAX_VISIBLE_STEPS = 3   # Max steps to show (scroll effect)
+            _STATUS_MAP = {
+                "pending": ("⏳ 等待中", "orange"),
+                "running": ("🔄 进行中", "blue"),
+                "success": ("✅ 完成", "green"),
+                "failed": ("❌ 失败", "red"),
+            }
 
             while True:
                 try:
@@ -11763,9 +12214,23 @@ class GatewayRunner:
                     if not _run_still_current():
                         return
 
+                    # Build scroll-formatted content (status header + latest 3 steps)
+                    _visible = progress_lines[-_MAX_VISIBLE_STEPS:] if len(progress_lines) > _MAX_VISIBLE_STEPS else progress_lines
+                    _hidden_count = len(progress_lines) - _MAX_VISIBLE_STEPS if len(progress_lines) > _MAX_VISIBLE_STEPS else 0
+                    
+                    _status_text, _status_color = _STATUS_MAP.get("running", _STATUS_MAP["running"])
+                    _content_parts = [f"**{_status_text}**", ""]
+                    if _hidden_count > 0:
+                        _content_parts.append(f"📋 ... 还有 {_hidden_count} 个历史步骤")
+                        _content_parts.append("")
+                    _content_parts.extend(_visible)
+                    _content_parts.append("")
+                    _content_parts.append(f"---")
+                    _content_parts.append(f"{_status_text}")
+                    full_text = "\n".join(_content_parts)
+                    
                     if can_edit and progress_msg_id is not None:
                         # Try to edit the existing progress message
-                        full_text = "\n".join(progress_lines)
                         result = await adapter.edit_message(
                             chat_id=source.chat_id,
                             message_id=progress_msg_id,
@@ -11785,8 +12250,7 @@ class GatewayRunner:
                             await adapter.send(chat_id=source.chat_id, content=msg, metadata=_progress_metadata)
                     else:
                         if can_edit:
-                            # First tool: send all accumulated text as new message
-                            full_text = "\n".join(progress_lines)
+                            # First tool: send scroll-formatted message
                             result = await adapter.send(chat_id=source.chat_id, content=full_text, metadata=_progress_metadata)
                         else:
                             # Editing unsupported: send just this line
@@ -11836,7 +12300,18 @@ class GatewayRunner:
                             break
                     # Final edit with all remaining tools (only if editing works)
                     if can_edit and progress_lines and progress_msg_id:
-                        full_text = "\n".join(progress_lines)
+                        _status_text, _status_color = _STATUS_MAP.get("success", _STATUS_MAP["success"])
+                        _visible = progress_lines[-_MAX_VISIBLE_STEPS:] if len(progress_lines) > _MAX_VISIBLE_STEPS else progress_lines
+                        _hidden_count = len(progress_lines) - _MAX_VISIBLE_STEPS if len(progress_lines) > _MAX_VISIBLE_STEPS else 0
+                        _content_parts = [f"**{_status_text}**", ""]
+                        if _hidden_count > 0:
+                            _content_parts.append(f"📋 ... 还有 {_hidden_count} 个历史步骤")
+                            _content_parts.append("")
+                        _content_parts.extend(_visible)
+                        _content_parts.append("")
+                        _content_parts.append(f"---")
+                        _content_parts.append(f"{_status_text}")
+                        full_text = "\n".join(_content_parts)
                         try:
                             await adapter.edit_message(
                                 chat_id=source.chat_id,
@@ -12417,18 +12892,19 @@ class GatewayRunner:
                 message = (
                     f"[System note: Your previous turn in this session was interrupted "
                     f"by {_reason_phrase}. The conversation history below is intact. "
-                    f"If it contains unfinished tool result(s), process them first and "
-                    f"summarize what was accomplished, then address the user's new "
-                    f"message below.]\n\n"
+                    f"PRIORITIZE the user's new message below. If there are unfinished "
+                    f"tool results, briefly acknowledge them only if directly relevant; "
+                    f"otherwise focus entirely on the user's new message.]\n\n"
                     + message
                 )
             elif _has_fresh_tool_tail:
                 message = (
                     "[System note: Your previous turn was interrupted before you could "
                     "process the last tool result(s). The conversation history contains "
-                    "tool outputs you haven't responded to yet. Please finish processing "
-                    "those results and summarize what was accomplished, then address the "
-                    "user's new message below.]\n\n"
+                    "tool outputs you haven't responded to yet. PRIORITIZE the user's "
+                    "new message below. If the tool results are directly relevant, "
+                    "briefly summarize them first; if not, ignore them and respond to "
+                    "the user's message directly.]\n\n"
                     + message
                 )
 
@@ -12490,6 +12966,12 @@ class GatewayRunner:
             
             # Return final response, or a message if something went wrong
             final_response = result.get("final_response")
+
+            # INTENT GATE (2026-05-01): If agent returned an intent confirmation request,
+            # prepend it to the response so the user sees the clarification prompt
+            _intent_confirm = result.get("intent_confirmation_message")
+            if _intent_confirm:
+                final_response = f"{_intent_confirm}\n\n{final_response or ''}"
 
             # Extract actual token counts from the agent instance used for this run
             _last_prompt_toks = 0

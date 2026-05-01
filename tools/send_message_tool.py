@@ -120,7 +120,17 @@ SEND_MESSAGE_SCHEMA = {
         "(not just a bare platform name), call send_message(action='list') FIRST to see "
         "available targets, then send to the correct one.\n"
         "If the user just says a platform name like 'send to telegram', send directly "
-        "to the home channel without listing first."
+        "to the home channel without listing first.\n\n"
+        "For Feishu (飞书), you can send interactive cards by setting card_type to one of:\n"
+        "- 'progress': Task progress card with steps and percentage\n"
+        "- 'notification': Simple notification card with title and content\n"
+        "- 'approval': Approval card with action buttons\n"
+        "- 'status': Status update card with color-coded header\n"
+        "When card_type is set, the message should be a JSON string with card data.\n\n"
+        "SCROLL CARD MODE (Feishu only):\n"
+        "Set scroll_mode=true to send all steps in a single scrolling card instead of separate messages. "
+        "The first call creates the card, subsequent calls update it. "
+        "Use scroll_action='init' to create, 'step' to append, 'done' to finish."
     ),
     "parameters": {
         "type": "object",
@@ -136,7 +146,25 @@ SEND_MESSAGE_SCHEMA = {
             },
             "message": {
                 "type": "string",
-                "description": "The message text to send. To send an image or file, include MEDIA:<local_path> (e.g. 'MEDIA:/tmp/hermes/cache/img_xxx.jpg') in the message — the platform will deliver it as a native media attachment."
+                "description": "The message text to send. To send an image or file, include MEDIA:<local_path> (e.g. 'MEDIA:/tmp/hermes/cache/img_xxx.jpg') in the message — the platform will deliver it as a native media attachment. For cards, this should be a JSON string with card data fields."
+            },
+            "card_type": {
+                "type": "string",
+                "enum": ["progress", "notification", "approval", "status", "interactive"],
+                "description": "Optional. For Feishu only. Send an interactive card instead of plain text. 'progress' shows task progress, 'notification' for alerts, 'approval' for buttons, 'status' for state updates, 'interactive' for custom card JSON."
+            },
+            "scroll_mode": {
+                "type": "boolean",
+                "description": "Optional. For Feishu only. When true, sends/updates a scrolling card that accumulates all steps instead of sending separate messages."
+            },
+            "scroll_action": {
+                "type": "string",
+                "enum": ["init", "start", "step", "done", "fail"],
+                "description": "Optional. For scroll_mode only. 'init' creates a new scrolling card (status: pending), 'start' marks as running, 'step' appends a step, 'done' marks as complete, 'fail' marks as failed."
+            },
+            "scroll_card_id": {
+                "type": "string",
+                "description": "Optional. For scroll_mode only. The card_id returned from a previous init call, used to update the same card."
             }
         },
         "required": []
@@ -167,6 +195,31 @@ def _handle_send(args):
     """Send a message to a platform target."""
     target = args.get("target", "")
     message = args.get("message", "")
+    card_type = args.get("card_type", "")
+    scroll_mode = args.get("scroll_mode", False)
+    scroll_action = args.get("scroll_action", "")
+    scroll_card_id = args.get("scroll_card_id", "")
+    
+    # Auto-detect card type from message content if not specified
+    if not card_type and message.strip().startswith('{'):
+        try:
+            msg_data = json.loads(message)
+            # Auto-detect based on fields present
+            if 'percent' in msg_data or 'steps' in msg_data:
+                card_type = "progress"
+            elif 'level' in msg_data:
+                card_type = "notification"
+            elif 'buttons' in msg_data:
+                card_type = "approval"
+            elif 'status' in msg_data and msg_data.get('status') in ['running', 'success', 'failed', 'pending']:
+                card_type = "status"
+        except (json.JSONDecodeError, ValueError):
+            pass
+    
+    # Handle scroll mode for Feishu
+    if scroll_mode and target.startswith("feishu"):
+        return _handle_scroll_card_send(args)
+    
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
 
@@ -276,6 +329,7 @@ def _handle_send(args):
                 cleaned_message,
                 thread_id=thread_id,
                 media_files=media_files,
+                card_type=card_type,
             )
         )
         if used_home_channel and isinstance(result, dict) and result.get("success"):
@@ -305,6 +359,284 @@ def _handle_send(args):
         return json.dumps(result)
     except Exception as e:
         return json.dumps(_error(f"Send failed: {e}"))
+
+
+def _handle_scroll_card_send(args):
+    """
+    Handle scroll card mode for Feishu - 方案E (text消息滚动 + card总结)
+    
+    核心原理：飞书API限制
+    - interactive卡片无法通过PATCH更新header颜色（只能更新elements）
+    - text消息可以通过PUT编辑content，实现原地滚动
+    - 因此：滚动过程用text消息，最后发送总结卡片
+    """
+    import asyncio
+    
+    target = args.get("target", "feishu")
+    message = args.get("message", "")
+    scroll_action = args.get("scroll_action", "step")
+    scroll_card_id = args.get("scroll_card_id", "")
+    
+    # Parse target to get chat_id
+    parts = target.split(":", 1)
+    platform_name = parts[0].strip().lower()
+    target_ref = parts[1].strip() if len(parts) > 1 else None
+    chat_id = None
+    
+    if target_ref:
+        chat_id, _, is_explicit = _parse_target_ref(platform_name, target_ref)
+    
+    if not chat_id:
+        # Try to get home channel
+        try:
+            from gateway.config import load_gateway_config
+            config = load_gateway_config()
+            from gateway.config import Platform
+            home = config.get_home_channel(Platform.FEISHU)
+            if home:
+                chat_id = home.chat_id
+        except Exception:
+            pass
+    
+    if not chat_id:
+        return json.dumps({"error": "No chat_id available for scroll card. Specify feishu:CHAT_ID or set home channel."})
+    
+    # Import scroll card manager
+    try:
+        import sys
+        sys.path.insert(0, '/Users/mars/.hermes/scripts')
+        from feishu_scroll_card import scroll_card_manager
+    except ImportError as e:
+        return json.dumps({"error": f"Scroll card module not available: {e}"})
+    
+    try:
+        from gateway.platforms.feishu import FeishuAdapter, FEISHU_AVAILABLE
+        if not FEISHU_AVAILABLE:
+            return json.dumps({"error": "Feishu dependencies not installed."})
+    except ImportError:
+        return json.dumps({"error": "Feishu dependencies not installed."})
+    
+    # Helper to create adapter
+    def _create_adapter():
+        from gateway.config import load_gateway_config, Platform
+        config = load_gateway_config()
+        pconfig = config.platforms.get(Platform.FEISHU)
+        adapter = FeishuAdapter(pconfig)
+        domain_name = getattr(adapter, "_domain_name", "feishu")
+        from gateway.platforms.feishu import FEISHU_DOMAIN, LARK_DOMAIN
+        domain = FEISHU_DOMAIN if domain_name != "lark" else LARK_DOMAIN
+        adapter._client = adapter._build_lark_client(domain)
+        return adapter
+    
+    # Handle different scroll actions
+    if scroll_action == "init":
+        # 方案E: init发送text消息（不是interactive卡片）
+        title = message or "任务执行中"
+        card_id = scroll_card_manager.init_card(title, "", chat_id, status="running")
+        if not card_id:
+            return json.dumps({"error": "Failed to initialize scroll card"})
+        
+        # Build initial text content (用于滚动更新)
+        payload = scroll_card_manager.build_update_payload(card_id)
+        if not payload:
+            return json.dumps({"error": "Failed to build scroll card payload"})
+        
+        text_content = payload.get("text_content", f"**🔄 {title}**\n\n_正在开始..._")
+        
+        # 发送初始card消息（不是text消息，这样才能用update_card更新）
+        try:
+            adapter = _create_adapter()
+            card_content = payload.get("card")
+            
+            def _send_card_sync():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    return loop.run_until_complete(adapter.send_card(chat_id, card_content))
+                finally:
+                    loop.close()
+            
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(_send_card_sync)
+                result = future.result(timeout=30)
+            
+            if result.success:
+                scroll_card_manager.set_message_id(card_id, result.message_id)
+                return json.dumps({
+                    "success": True,
+                    "scroll_card_id": card_id,
+                    "message_id": result.message_id,
+                    "mode": "scroll_card",
+                    "status": "initialized"
+                })
+            else:
+                return json.dumps({"error": f"Failed to send card message: {result.error}"})
+        except Exception as e:
+            return json.dumps({"error": f"Failed to send card message: {e}"})
+    
+    elif scroll_action == "start":
+        # 开始执行：将pending状态改为running
+        card_id = scroll_card_id
+        if not card_id:
+            return json.dumps({"error": "scroll_card_id is required for start action"})
+        
+        scroll_card_manager.start_card(card_id)
+        
+        # 重新构建并更新text消息
+        payload = scroll_card_manager.build_update_payload(card_id)
+        if not payload:
+            return json.dumps({"error": "Failed to build scroll card update payload"})
+        
+        message_id = payload.get("message_id")
+        if not message_id:
+            return json.dumps({"error": "No message_id found"})
+        
+        try:
+            adapter = _create_adapter()
+            card_content = payload.get("card")
+            
+            def _update_card_sync():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    # 使用PATCH更新card消息
+                    return loop.run_until_complete(adapter.update_card(message_id, card_content))
+                finally:
+                    loop.close()
+            
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(_update_card_sync)
+                result = future.result(timeout=30)
+            
+            if result.success:
+                return json.dumps({
+                    "success": True,
+                    "scroll_card_id": card_id,
+                    "message_id": message_id,
+                    "mode": "scroll_card",
+                    "status": "started"
+                })
+            else:
+                return json.dumps({"error": f"Failed to update card: {result.error}"})
+        except Exception as e:
+            return json.dumps({"error": f"Failed to update card: {e}"})
+    
+    elif scroll_action == "step":
+        # 追加步骤到滚动文本
+        card_id = scroll_card_id
+        if not card_id:
+            return json.dumps({"error": "scroll_card_id is required for step action"})
+        
+        # Parse message as step info
+        step_name = message
+        step_result = ""
+        if "|" in message:
+            parts = message.split("|", 1)
+            step_name = parts[0].strip()
+            step_result = parts[1].strip()
+        
+        # 追加步骤（自动transition pending→running）
+        scroll_card_manager.append_step(card_id, step_name, step_result)
+        
+        # 构建更新后的文本内容
+        payload = scroll_card_manager.build_update_payload(card_id)
+        if not payload:
+            return json.dumps({"error": "Failed to build scroll card update payload"})
+        
+        message_id = payload.get("message_id")
+        if not message_id:
+            return json.dumps({"error": "No message_id found"})
+        
+        try:
+            adapter = _create_adapter()
+            card_content = payload.get("card")
+            
+            def _update_card_sync():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    return loop.run_until_complete(adapter.update_card(message_id, card_content))
+                finally:
+                    loop.close()
+            
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(_update_card_sync)
+                result = future.result(timeout=30)
+            
+            if result.success:
+                return json.dumps({
+                    "success": True,
+                    "scroll_card_id": card_id,
+                    "message_id": message_id,
+                    "mode": "scroll_card",
+                    "status": "step_added"
+                })
+            else:
+                return json.dumps({"error": f"Failed to update card: {result.error}"})
+        except Exception as e:
+            return json.dumps({"error": f"Failed to update card: {e}"})
+    
+    elif scroll_action in ("done", "fail"):
+        # 完成或失败：更新卡片为最终状态
+        card_id = scroll_card_id
+        if not card_id:
+            return json.dumps({"error": "scroll_card_id is required for done/fail actions"})
+        
+        # 更新状态
+        if scroll_action == "done":
+            card_state = scroll_card_manager.get_card_state(card_id)
+            if card_state and card_state.get("status") == "pending":
+                scroll_card_manager.start_card(card_id)
+            scroll_card_manager.finish_card(card_id, message)
+        else:
+            scroll_card_manager.fail_card(card_id, message)
+        
+        # 构建最终内容（finalize=True 显示所有steps）
+        payload = scroll_card_manager.build_update_payload(card_id, finalize=True)
+        if not payload:
+            return json.dumps({"error": "Failed to build scroll card update payload"})
+        
+        message_id = payload.get("message_id")
+        if not message_id:
+            return json.dumps({"error": "No message_id found"})
+        
+        # 用 update_card 更新为最终状态
+        try:
+            adapter = _create_adapter()
+            card_content = payload.get("card")
+            
+            def _finalize_card_sync():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    return loop.run_until_complete(adapter.update_card(message_id, card_content))
+                finally:
+                    loop.close()
+            
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(_finalize_card_sync)
+                result = future.result(timeout=30)
+            
+            if result.success:
+                scroll_card_manager.cleanup(card_id)
+                return json.dumps({
+                    "success": True,
+                    "scroll_card_id": card_id,
+                    "message_id": message_id,
+                    "mode": "scroll_card",
+                    "status": "finished" if scroll_action == "done" else "failed"
+                })
+            else:
+                return json.dumps({"error": f"Failed to update card: {result.error}"})
+        except Exception as e:
+            return json.dumps({"error": f"Failed to update card: {e}"})
+    
+    else:
+        return json.dumps({"error": f"Unknown scroll_action: {scroll_action}"})
 
 
 def _parse_target_ref(platform_name: str, target_ref: str):
@@ -436,7 +768,7 @@ async def _send_via_adapter(platform, pconfig, chat_id, chunk):
     return {"error": f"No live adapter for platform '{platform.value}'. Is the gateway running with this platform connected?"}
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None):
+async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, card_type=None):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -492,10 +824,10 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
 
     # Smart-chunk the message to fit within platform limits.
     # For short messages or platforms without a known limit this is a no-op.
-    # Telegram measures length in UTF-16 code units, not Unicode codepoints.
+    # Telegram and Feishu measure length in UTF-16 code units, not Unicode codepoints.
     max_len = _MAX_LENGTHS.get(platform)
     if max_len:
-        _len_fn = utf16_len if platform == Platform.TELEGRAM else None
+        _len_fn = utf16_len if platform in {Platform.TELEGRAM, Platform.FEISHU} else None
         chunks = BasePlatformAdapter.truncate_message(message, max_len, len_fn=_len_fn)
     else:
         chunks = [message]
@@ -592,15 +924,17 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if media_files and not message.strip():
         return {
             "error": (
-                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, weixin, signal and yuanbao; "
+<<<<<<< HEAD
+                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, feishu, weixin, signal and yuanbao; "
                 f"target {platform.value} had only media attachments"
             )
         }
     warning = None
-    if media_files:
+    if media_files and platform not in {Platform.TELEGRAM, Platform.DISCORD, Platform.MATRIX, Platform.FEISHU, Platform.WEIXIN, Platform.SIGNAL}:
         warning = (
             f"MEDIA attachments were omitted for {platform.value}; "
-            "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal and yuanbao"
+<<<<<<< HEAD
+            "native send_message media delivery is currently only supported for telegram, discord, matrix, feishu, weixin, signal and yuanbao"
         )
 
     last_result = None
@@ -624,7 +958,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         elif platform == Platform.DINGTALK:
             result = await _send_dingtalk(pconfig.extra, chat_id, chunk)
         elif platform == Platform.FEISHU:
-            result = await _send_feishu(pconfig, chat_id, chunk, thread_id=thread_id)
+            result = await _send_feishu(pconfig, chat_id, chunk, media_files=media_files, thread_id=thread_id, card_type=card_type)
         elif platform == Platform.WECOM:
             result = await _send_wecom(pconfig.extra, chat_id, chunk)
         elif platform == Platform.BLUEBUBBLES:
@@ -1578,27 +1912,57 @@ async def _send_bluebubbles(extra, chat_id, message):
         return _error(f"BlueBubbles send failed: {e}")
 
 
-async def _send_feishu(pconfig, chat_id, message, media_files=None, thread_id=None):
-    """Send via Feishu/Lark using the adapter's send pipeline."""
+async def _send_feishu(pconfig, chat_id, message, media_files=None, thread_id=None, card_type=None):
+    """Send via Feishu/Lark using the adapter's send pipeline.
+    
+    Supports interactive cards when card_type is specified or auto-detected.
+    Delegates card building to FeishuAdapter.send() which has built-in auto-detection.
+    """
     try:
         from gateway.platforms.feishu import FeishuAdapter, FEISHU_AVAILABLE
         if not FEISHU_AVAILABLE:
             return {"error": "Feishu dependencies not installed. Run: pip install 'hermes-agent[feishu]'"}
-        from gateway.platforms.feishu import FEISHU_DOMAIN, LARK_DOMAIN
     except ImportError:
         return {"error": "Feishu dependencies not installed. Run: pip install 'hermes-agent[feishu]'"}
 
     media_files = media_files or []
-
+    
     try:
         adapter = FeishuAdapter(pconfig)
         domain_name = getattr(adapter, "_domain_name", "feishu")
+        from gateway.platforms.feishu import FEISHU_DOMAIN, LARK_DOMAIN
         domain = FEISHU_DOMAIN if domain_name != "lark" else LARK_DOMAIN
         adapter._client = adapter._build_lark_client(domain)
         metadata = {"thread_id": thread_id} if thread_id else None
 
-        last_result = None
-        if message.strip():
+        # Handle card message - pass card_type to adapter
+        if card_type and message.strip():
+            # Pre-build the card and send via send_card
+            try:
+                card_data = json.loads(message) if message.strip().startswith('{') else {"text": message}
+            except json.JSONDecodeError:
+                card_data = {"text": message}
+            
+            # Build card based on type
+            if card_type == "progress":
+                card = _build_progress_card(card_data)
+            elif card_type == "notification":
+                card = _build_notification_card(card_data)
+            elif card_type == "approval":
+                card = _build_approval_card(card_data)
+            elif card_type == "status":
+                card = _build_status_card(card_data)
+            elif card_type == "interactive":
+                # Custom card - message should be full card JSON
+                card = card_data if isinstance(card_data, dict) else json.loads(card_data)
+            else:
+                card = _build_notification_card(card_data)
+            
+            last_result = await adapter.send_card(chat_id, card, reply_to=None, metadata=metadata)
+            if not last_result.success:
+                return _error(f"Feishu card send failed: {last_result.error}")
+        elif message.strip():
+            # Let adapter.handle_auto_detect cards from message content
             last_result = await adapter.send(chat_id, message, metadata=metadata)
             if not last_result.success:
                 return _error(f"Feishu send failed: {last_result.error}")
@@ -1737,6 +2101,220 @@ registry.register(
     toolset="messaging",
     schema=SEND_MESSAGE_SCHEMA,
     handler=send_message_tool,
-    check_fn=_check_send_message,
+)
+
+
+# ---------------------------------------------------------------------------
+# Feishu Card Builders
+# ---------------------------------------------------------------------------
+
+def _build_progress_card(data: dict) -> dict:
+    """Build a task progress card for Feishu.
+    
+    Expected data fields:
+    - title: str - Card title
+    - percent: int - Progress percentage (0-100)
+    - steps: list - List of dicts with 'name', 'status' (done/current/pending), 'time'
+    - elapsed: str - Elapsed time string
+    - estimated: str - Estimated remaining time
+    """
+    title = data.get("title", "任务进度")
+    percent = data.get("percent", 0)
+    steps = data.get("steps", [])
+    elapsed = data.get("elapsed", "")
+    estimated = data.get("estimated", "")
+    
+    # Build progress bar with Unicode blocks
+    filled = int(percent / 10)
+    empty = 10 - filled
+    progress_bar = "█" * filled + "░" * empty
+    
+    # Build steps text
+    steps_text = []
+    for step in steps:
+        name = step.get("name", "")
+        status = step.get("status", "pending")
+        time_str = step.get("time", "")
+        if status == "done":
+            icon = "✅"
+            prefix = ""
+        elif status == "current":
+            icon = "🔄"
+            prefix = "**"
+        else:
+            icon = "⏳"
+            prefix = ""
+        time_part = f"  {time_str}" if time_str else ""
+        steps_text.append(f"{icon} {prefix}{name}{prefix}{time_part}")
+    
+    # Color template based on progress
+    if percent >= 100:
+        template = "green"
+    elif percent >= 60:
+        template = "blue"
+    elif percent >= 30:
+        template = "orange"
+    else:
+        template = "red"
+    
+    card = {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"content": f"🚀 {title}", "tag": "plain_text"},
+            "template": template,
+        },
+        "elements": [
+            {
+                "tag": "markdown",
+                "content": f"**进度:** {progress_bar}  {percent}%",
+            },
+            {
+                "tag": "markdown",
+                "content": "\n".join(steps_text) if steps_text else "⏳ 等待开始...",
+            },
+        ],
+    }
+    
+    # Add time info if provided
+    if elapsed or estimated:
+        time_text = ""
+        if elapsed:
+            time_text += f"⏱️ 已用: {elapsed}  "
+        if estimated:
+            time_text += f"⏳ 预计: {estimated}"
+        card["elements"].append({
+            "tag": "markdown",
+            "content": time_text,
+        })
+    
+    return card
+
+
+def _build_notification_card(data: dict) -> dict:
+    """Build a notification card for Feishu.
+    
+    Expected data fields:
+    - title: str - Notification title
+    - content: str - Main content (markdown supported)
+    - level: str - "info", "warning", "success", "error"
+    """
+    title = data.get("title", "通知")
+    content = data.get("content", data.get("text", ""))
+    level = data.get("level", "info")
+    
+    template_map = {
+        "info": "blue",
+        "warning": "orange",
+        "success": "green",
+        "error": "red",
+    }
+    icon_map = {
+        "info": "ℹ️",
+        "warning": "⚠️",
+        "success": "✅",
+        "error": "❌",
+    }
+    
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"content": f"{icon_map.get(level, 'ℹ️')} {title}", "tag": "plain_text"},
+            "template": template_map.get(level, "blue"),
+        },
+        "elements": [
+            {
+                "tag": "markdown",
+                "content": content,
+            },
+        ],
+    }
+
+
+def _build_approval_card(data: dict) -> dict:
+    """Build an approval card with action buttons.
+    
+    Expected data fields:
+    - title: str - Card title
+    - content: str - Description content
+    - buttons: list - List of dicts with 'label', 'action', 'type' (primary/default/danger)
+    """
+    title = data.get("title", "需要确认")
+    content = data.get("content", data.get("text", ""))
+    buttons = data.get("buttons", [])
+    
+    actions = []
+    for btn in buttons:
+        actions.append({
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": btn.get("label", "确认")},
+            "type": btn.get("type", "default"),
+            "value": {"hermes_action": btn.get("action", "approve"), "data": btn.get("data", {})},
+        })
+    
+    card = {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"content": f"⚠️ {title}", "tag": "plain_text"},
+            "template": "orange",
+        },
+        "elements": [
+            {
+                "tag": "markdown",
+                "content": content,
+            },
+        ],
+    }
+    
+    if actions:
+        card["elements"].append({
+            "tag": "action",
+            "actions": actions,
+        })
+    
+    return card
+
+
+def _build_status_card(data: dict) -> dict:
+    """Build a status update card.
+    
+    Expected data fields:
+    - title: str - Card title
+    - status: str - "running", "success", "failed", "pending"
+    - details: str - Additional details (markdown)
+    """
+    title = data.get("title", "状态更新")
+    status = data.get("status", "pending")
+    details = data.get("details", data.get("content", data.get("text", "")))
+    
+    status_config = {
+        "running": {"template": "blue", "icon": "🔄", "label": "进行中"},
+        "success": {"template": "green", "icon": "✅", "label": "成功"},
+        "failed": {"template": "red", "icon": "❌", "label": "失败"},
+        "pending": {"template": "orange", "icon": "⏳", "label": "等待中"},
+    }
+    
+    config = status_config.get(status, status_config["pending"])
+    
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"content": f"{config['icon']} {title} - {config['label']}", "tag": "plain_text"},
+            "template": config["template"],
+        },
+        "elements": [
+            {
+                "tag": "markdown",
+                "content": details,
+            },
+        ],
+    }
+
+
+# Register the tool
+registry.register(
+    name="send_message",
+    toolset="messaging",
+    schema=SEND_MESSAGE_SCHEMA,
+    handler=send_message_tool,
     emoji="📨",
 )

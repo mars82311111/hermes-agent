@@ -99,6 +99,7 @@ from gateway.platforms.base import (
     MessageType,
     ProcessingOutcome,
     SendResult,
+    DEFAULT_HTTPX_LIMITS,
     resolve_proxy_url,
     proxy_kwargs_for_aiohttp,
 )
@@ -1053,7 +1054,7 @@ class MatrixAdapter(BasePlatformAdapter):
                         )
             except ImportError:
                 import httpx
-                _httpx_kw: dict = {}
+                _httpx_kw: dict = {"limits": DEFAULT_HTTPX_LIMITS}
                 if self._proxy_url:
                     _httpx_kw["proxy"] = self._proxy_url
                 async with httpx.AsyncClient(**_httpx_kw) as http:

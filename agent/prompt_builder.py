@@ -588,7 +588,28 @@ def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
     return manifest
 
 
-def _load_skills_snapshot(skills_dir: Path) -> Optional[dict]:
+def _build_skills_fingerprint(skills_dir: Path, external_dirs: list[Path]) -> tuple[int, int]:
+    """Return a lightweight fingerprint (file_count, max_mtime_ns) of all skill directories.
+
+    Used to invalidate the in-process LRU cache when skills are added, removed,
+    or modified — including manual file copies and external directory updates.
+    """
+    total_files = 0
+    max_mtime = 0
+    for directory in [skills_dir] + [d for d in external_dirs if d.exists()]:
+        for filename in ("SKILL.md", "DESCRIPTION.md"):
+            for path in iter_skill_index_files(directory, filename):
+                total_files += 1
+                try:
+                    st = path.stat()
+                    if st.st_mtime_ns > max_mtime:
+                        max_mtime = st.st_mtime_ns
+                except OSError:
+                    continue
+    return (total_files, max_mtime)
+
+
+def _load_skills_snapshot(skills_dir: Path, external_dirs: list[Path] | None = None) -> Optional[dict]:
     """Load the disk snapshot if it exists and its manifest still matches."""
     snapshot_path = _skills_prompt_snapshot_path()
     if not snapshot_path.exists():
@@ -603,6 +624,16 @@ def _load_skills_snapshot(skills_dir: Path) -> Optional[dict]:
         return None
     if snapshot.get("manifest") != _build_skills_manifest(skills_dir):
         return None
+    # Also validate external directories if present
+    external_dirs = external_dirs or []
+    stored_external = snapshot.get("external_manifests") or {}
+    for ext_dir in external_dirs:
+        if not ext_dir.exists():
+            continue
+        key = str(ext_dir.resolve())
+        current_manifest = _build_skills_manifest(ext_dir)
+        if stored_external.get(key) != current_manifest:
+            return None
     return snapshot
 
 
@@ -611,11 +642,17 @@ def _write_skills_snapshot(
     manifest: dict[str, list[int]],
     skill_entries: list[dict],
     category_descriptions: dict[str, str],
+    external_dirs: list[Path] | None = None,
 ) -> None:
     """Persist skill metadata to disk for fast cold-start reuse."""
+    external_manifests: dict[str, dict[str, list[int]]] = {}
+    for ext_dir in (external_dirs or []):
+        if ext_dir.exists():
+            external_manifests[str(ext_dir.resolve())] = _build_skills_manifest(ext_dir)
     payload = {
         "version": _SKILLS_SNAPSHOT_VERSION,
         "manifest": manifest,
+        "external_manifests": external_manifests,
         "skills": skill_entries,
         "category_descriptions": category_descriptions,
     }
@@ -654,6 +691,65 @@ def _build_snapshot_entry(
         "conditions": extract_skill_conditions(frontmatter),
     }
 
+
+# =========================================================================
+# Essential skills (always shown in full in the system prompt)
+# =========================================================================
+
+# These ~18 skills are loaded into the system prompt on every turn.
+# All other skills are accessible via the category catalog below.
+# This keeps the skills index compact (~600 tokens) while ensuring
+# the most important skills are always visible, regardless of total skill count.
+_ESSENTIAL_SKILL_NAMES: set[str] = {
+    # 搜索与信息
+    "tavily-search",
+    "summarize-pro",
+    "graph-of-thoughts",
+    # 浏览器与自动化
+    "agent-browser",
+    "playwright-scraper-skill",
+    "ghost-os-control",
+    "desktop-control",
+    "browser-automation-stealth",
+    # 消息与社交媒体
+    "feishu-card",
+    "x-twitter-post-macos",
+    "xiaohongshu-chrome-applescript-post",
+    "x-twitter-browser-automation",
+    # 代码与调试
+    "claude-code",
+    "codex",
+    "systematic-debugging",
+    "test-driven-development",
+    "github-code-review",
+    "github-pr-workflow",
+    # 任务与计划
+    "execute-task",
+    "writing-plans",
+    # 系统与调试
+    "hermes-agent-systematic-debug",
+    "hermes-session-hang-debug",
+    "hermes-context-loss-debug",
+    "hermes-cron-memory-debug",
+    "hermes-context-compression-debug",
+    # 记忆系统
+    "memory-mempalace-skill",
+    "hermes-memory-architecture",
+    "hermes-memory-maintenance",
+    "memory-skill-workflow",
+    "mempalace-deep-audit",
+    # 监督与进化
+    "supervision-system-v3",
+    "hermes-endogenous-evolution-system",
+    "auto-retrospective-workflow",
+    # Skill管理
+    "clawhub-skill-exploration",
+    "problem-skill-mapper",
+    "skill-problem-trigger-system",
+    "find-skills",
+    # 城哥档案系统
+    "cheng-profile-reader",
+}
 
 # =========================================================================
 # Skills index
@@ -743,7 +839,9 @@ def build_skills_system_prompt(
         or ""
     )
     disabled = get_disabled_skill_names()
+    skills_fingerprint = _build_skills_fingerprint(skills_dir, external_dirs)
     cache_key = (
+        skills_fingerprint,
         str(skills_dir.resolve()),
         tuple(str(d) for d in external_dirs),
         tuple(sorted(str(t) for t in (available_tools or set()))),
@@ -758,7 +856,7 @@ def build_skills_system_prompt(
             return cached
 
     # ── Layer 2: disk snapshot ────────────────────────────────────────
-    snapshot = _load_skills_snapshot(skills_dir)
+    snapshot = _load_skills_snapshot(skills_dir, external_dirs)
 
     skills_by_category: dict[str, list[tuple[str, str]]] = {}
     category_descriptions: dict[str, str] = {}
@@ -830,6 +928,7 @@ def build_skills_system_prompt(
             _build_skills_manifest(skills_dir),
             skill_entries,
             category_descriptions,
+            external_dirs,
         )
 
     # ── External skill directories ─────────────────────────────────────
@@ -886,28 +985,97 @@ def build_skills_system_prompt(
     if not skills_by_category:
         result = ""
     else:
+        # ── Three-layer skill discovery system ──
+        # Layer 1: Essential skills (always visible)
+        # Layer 2: Category catalog (compact, scalable — doesn't grow with skill count)
+        # Layer 3: External search (clawhub / find-skills)
+
+        # Build essential skill map: name -> description
+        essential_skills: dict[str, str] = {}
+        for category, cat_skills in skills_by_category.items():
+            for name, desc in cat_skills:
+                if name in _ESSENTIAL_SKILL_NAMES:
+                    essential_skills[name] = desc
+
+        # Define purpose-based groups
+        essential_groups = {
+            "搜索与信息": ["tavily-search", "summarize-pro", "graph-of-thoughts"],
+            "浏览器与自动化": [
+                "agent-browser", "playwright-scraper-skill", "ghost-os-control",
+                "desktop-control", "browser-automation-stealth",
+            ],
+            "消息与社交媒体": [
+                "feishu-card", "x-twitter-post-macos",
+                "xiaohongshu-chrome-applescript-post", "x-twitter-browser-automation",
+            ],
+            "代码与调试": [
+                "claude-code", "codex", "systematic-debugging",
+                "test-driven-development", "github-code-review", "github-pr-workflow",
+            ],
+            "任务与计划": ["execute-task", "writing-plans"],
+            "系统与调试": [
+                "hermes-agent-systematic-debug", "hermes-session-hang-debug",
+                "hermes-context-loss-debug", "hermes-cron-memory-debug",
+                "hermes-context-compression-debug",
+            ],
+            "记忆系统": [
+                "memory-mempalace-skill", "hermes-memory-architecture",
+                "hermes-memory-maintenance", "memory-skill-workflow",
+                "mempalace-deep-audit",
+            ],
+            "监督与进化": [
+                "supervision-system-v3", "hermes-endogenous-evolution-system",
+                "auto-retrospective-workflow",
+            ],
+            "Skill管理": [
+                "clawhub-skill-exploration", "problem-skill-mapper",
+                "skill-problem-trigger-system", "find-skills",
+            ],
+        }
+
         index_lines = []
-        for category in sorted(skills_by_category.keys()):
-            cat_desc = category_descriptions.get(category, "")
-            if cat_desc:
-                index_lines.append(f"  {category}: {cat_desc}")
-            else:
-                index_lines.append(f"  {category}:")
-            # Deduplicate and sort skills within each category
-            seen = set()
-            for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
-                if name in seen:
-                    continue
-                seen.add(name)
-                if desc:
-                    index_lines.append(f"    - {name}: {desc}")
-                else:
+
+        # Layer 1: Essential skills grouped by purpose
+        index_lines.append("  # === 高频工具 — 遇到问题优先检查这里 ===")
+        for group_name, skill_names in essential_groups.items():
+            group_skills = [n for n in skill_names if n in essential_skills]
+            if group_skills:
+                index_lines.append(f"  {group_name}:")
+                for name in group_skills:
                     index_lines.append(f"    - {name}")
+
+        index_lines.append("")
+        index_lines.append("  # === 任务速查 — 按场景找category ===")
+        index_lines.append("  搜索/查资料      → research 或 tavily-search")
+        index_lines.append("  总结/概括        → summarize-pro")
+        index_lines.append("  复杂推理         → graph-of-thoughts")
+        index_lines.append("  访问/抓取网站    → openclaw-imports / browser-automation")
+        index_lines.append("  写代码/调试      → software-development / autonomous-ai-agents")
+        index_lines.append("  桌面控制         → automation")
+        index_lines.append("  发飞书消息      → messaging")
+        index_lines.append("  发社交媒体      → social-media")
+        index_lines.append("  系统调试         → hermes-agent")
+        index_lines.append("  记忆问题         → memory / memory-system")
+        index_lines.append("  不知道用什么     → skills_list() 查看全部")
+
+        index_lines.append("")
+        index_lines.append("  # === Skill目录 — call skills_list(category='xxx')展开 ===")
+
+        # Layer 2: Category catalog (name + count only, no descriptions)
+        for category in sorted(skills_by_category.keys()):
+            count = len(skills_by_category[category])
+            index_lines.append(f"  {category} ({count})")
 
         result = (
             "## Skills (mandatory)\n"
-            "Before replying, scan the skills below. If a skill matches or is even partially relevant "
-            "to your task, you MUST load it with skill_view(name) and follow its instructions. "
+            "Before replying, scan the skills below using the THREE-STEP process:\n"
+            "  STEP 1: Check the 高频工具 list — if your task matches, load that skill immediately.\n"
+            "  STEP 2: If not in 高频工具, call skill_search(query='任务关键词') first — "
+            "it searches both local and external skills by relevance.\n"
+            "  STEP 3: If skill_search returns insufficient results, use the 任务速查 to find "
+            "the right category, then call skills_list(category='xxx') to expand it.\n"
+            "If a skill matches or is even partially relevant to your task, "
+            "you MUST load it with skill_view(name) and follow its instructions. "
             "Err on the side of loading — it is always better to have context you don't need "
             "than to miss critical steps, pitfalls, or established workflows. "
             "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
@@ -930,10 +1098,14 @@ def build_skills_system_prompt(
             + "\n".join(index_lines) + "\n"
             "</available_skills>\n"
             "\n"
-            "Only proceed without loading a skill if genuinely none are relevant to the task."
+            "Only proceed without loading a skill if genuinely none are relevant to the task.\n"
+            "\n"
+            "TIP: New skills are automatically discoverable via skill_search() or skills_list(). "
+            "If you can't find a suitable local skill, search external repositories with "
+            "clawhub search or find-skills."
         )
 
-    # ── Store in LRU cache ────────────────────────────────────────────
+    # ── Store in LRU cache ───────────────────────────────────────────────────────
     with _SKILLS_PROMPT_CACHE_LOCK:
         _SKILLS_PROMPT_CACHE[cache_key] = result
         _SKILLS_PROMPT_CACHE.move_to_end(cache_key)

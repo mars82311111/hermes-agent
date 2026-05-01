@@ -180,6 +180,25 @@ def _normalize_for_deepseek(model_name: str) -> str:
     return "deepseek-chat"
 
 
+# Kimi (kimi-coding / kimi-coding-cn): all display names (kimi-k2.6, kimi-k2.5,
+# kimi-k2-thinking, etc.) map to the single API identifier "kimi-for-coding".
+def _normalize_for_kimi(model_name: str) -> str:
+    """Map any Kimi model name to the kimi-for-coding API identifier.
+
+    The Kimi /coding endpoint only accepts ``kimi-for-coding`` as the model
+    identifier regardless of which UI display name the user sees (kimi-k2.6,
+    kimi-k2.5, kimi-k2-thinking, etc.).
+    """
+    bare = (model_name or "").strip()
+    if not bare:
+        return "kimi-for-coding"
+    # Already the canonical API name
+    if bare.lower() == "kimi-for-coding":
+        return "kimi-for-coding"
+    # All other kimi-* names map to kimi-for-coding
+    return "kimi-for-coding"
+
+
 # ---------------------------------------------------------------------------
 # Helper utilities
 # ---------------------------------------------------------------------------
@@ -442,6 +461,10 @@ def normalize_model_for_provider(model_input: str, target_provider: str) -> str:
         if "/" in bare:
             return bare
         return _normalize_for_deepseek(bare)
+
+    # --- Kimi (kimi-coding / kimi-coding-cn): all names map to kimi-for-coding ---
+    if provider in ("kimi-coding", "kimi-coding-cn"):
+        return _normalize_for_kimi(name)
 
     # --- Direct providers: repair matching provider prefixes only ---
     if provider in _MATCHING_PREFIX_STRIP_PROVIDERS:

@@ -17,6 +17,8 @@ from typing import Iterable, Optional
 
 import httpx
 
+from gateway.platforms.base import DEFAULT_HTTPX_LIMITS
+
 logger = logging.getLogger(__name__)
 
 _TELEGRAM_API_HOST = "api.telegram.org"
@@ -190,7 +192,7 @@ async def discover_fallback_ips() -> list[str]:
     unreachable on this network).  Falls back to a hardcoded seed list when DoH
     is also unavailable.
     """
-    async with httpx.AsyncClient(timeout=httpx.Timeout(_DOH_TIMEOUT)) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(_DOH_TIMEOUT), limits=DEFAULT_HTTPX_LIMITS) as client:
         doh_tasks = [_query_doh_provider(client, p) for p in _DOH_PROVIDERS]
         system_dns_task = asyncio.to_thread(_resolve_system_dns)
         results = await asyncio.gather(system_dns_task, *doh_tasks, return_exceptions=True)

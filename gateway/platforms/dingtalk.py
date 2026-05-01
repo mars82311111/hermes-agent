@@ -94,6 +94,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    DEFAULT_HTTPX_LIMITS,
 )
 
 logger = logging.getLogger(__name__)
@@ -228,7 +229,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             return False
 
         try:
-            self._http_client = httpx.AsyncClient(timeout=30.0)
+            self._http_client = httpx.AsyncClient(timeout=30.0, limits=DEFAULT_HTTPX_LIMITS)
 
             credential = dingtalk_stream.Credential(
                 self._client_id, self._client_secret

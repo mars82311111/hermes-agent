@@ -1,0 +1,30 @@
+name: hermes_memory
+version: 1.0.0
+description: |
+  Hermes Memory Provider - 融合MemPalace和memory-lancedb-pro的统一记忆系统
+
+  特性:
+  - LanceDB向量存储 + BM25全文检索
+  - 混合检索 (RRF融合 + Cross-encoder Rerank)
+  - Weibull衰减引擎 + EMA反馈强化
+  - 知识图谱 (MemPalace KG)
+  - Working Memory + WAL崩溃恢复
+  - 噪声过滤 + Adaptive检索
+  - Multi-scope隔离
+
+requires:
+  - hermes-agent>=1.0.0
+
+dependencies:
+  - lancedb>=0.27.0
+  - pyarrow
+  - numpy
+
+tools:
+  - memory_search
+  - memory_store
+  - memory_recall
+  - memory_forget
+  - memory_profile
+  - memory_kg_search
+  - memory_stats
