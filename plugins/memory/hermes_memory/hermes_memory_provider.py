@@ -59,7 +59,7 @@ try:
     from .wal_manager import WALManager
     from .smart_extractor import smart_extract, queue_extraction
     from .noise_filter import is_noise
-    from .adaptive_retrieval import should_skip_retrieval, should_confirm_intent, build_intent_confirmation_card
+    from .adaptive_retrieval import should_skip_retrieval
     from .scope_isolation import Scope, can_access, ScopeGuard
 except ImportError as e:
     logger.warning("Failed to import some components: %s", e)
@@ -241,16 +241,7 @@ class HermesMemoryProvider:
         if not self._initialized:
             return ""
         
-        # INTENT GATE: Check if query needs user confirmation before retrieval
-        # This prevents retrieving wrong memories due to ambiguous keywords
-        if should_confirm_intent(query):
-            confirmation_msg = build_intent_confirmation_card(query)
-            if confirmation_msg:
-                # Return special prefix that signals "needs user confirmation"
-                # The agent/gateway will detect this and prompt the user
-                logger.info("Intent gate triggered for query: %s", query[:50])
-                return f"[INTENT_CONFIRMATION_NEEDED]\n{confirmation_msg}"
-        
+        # INTENT GATE: removed — user disabled it
         try:
             all_results = []
             # Search session scope first (more relevant)
